@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem -Path \"d:\\\\Programming\\\\Android_Studio\\\\Sender\" -Recurse | Where-Object { $_.PSIsContainer -eq $false } | Select-Object FullName | ForEach-Object { $_.FullName } | Sort-Object)"
+    ]
+  }
+}
