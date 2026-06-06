@@ -6,9 +6,9 @@ import io.ktor.http.content.PartData
 import io.ktor.http.content.forEachPart
 import io.ktor.http.content.streamProvider
 import io.ktor.server.application.*
-import io.ktor.server.netty.*
-import io.ktor.server.engine.*
-import com.example.sender.R
+import io.ktor.server.cio.*
+import io.ktor.server.engine.ApplicationEngine
+import io.ktor.server.engine.embeddedServer
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -301,8 +301,7 @@ private val HTML_PAGE = """
 
   /* ── WebSocket ── */
   const statusEl = document.getElementById('status');
-  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(wsProto + '//' + location.host + '/socket');
+  const ws = new WebSocket('ws://' + location.host + '/socket');
 
   ws.onopen = () => {
     ws.send(JSON.stringify({
@@ -512,11 +511,6 @@ private val HTML_PAGE = """
 
 // ── KtorServer ────────────────────────────────────────────────────────────────
 
-private const val HTTPS_PORT     = 8443
-private const val HTTP_PORT      = 8080  // plain-HTTP listener; redirects to HTTPS
-private const val KEYSTORE_PASS  = "senderpass"
-private const val KEYSTORE_ALIAS = "sender"
-
 class KtorServer(private val context: Context) {
 
     private val deviceManager = DeviceManager(context)
@@ -557,15 +551,6 @@ class KtorServer(private val context: Context) {
     private var server: ApplicationEngine? = null
     private var jmDns: JmDNS? = null
 
-    // ── TLS keystore ─────────────────────────────────────────────────────────
-
-    private fun loadKeyStore(): java.security.KeyStore =
-        java.security.KeyStore.getInstance("PKCS12").also { ks ->
-            context.resources.openRawResource(R.raw.sender_keystore).use { input ->
-                ks.load(input, KEYSTORE_PASS.toCharArray())
-            }
-        }
-
     // ── Start / stop ─────────────────────────────────────────────────────────
 
     fun start() {
@@ -581,53 +566,32 @@ class KtorServer(private val context: Context) {
             scope.launch {
                 try {
                     jmDns = JmDNS.create(java.net.InetAddress.getByName(mdnsIp), "phone")
-                    jmDns?.registerService(ServiceInfo.create("_https._tcp.local.", "Sender", HTTPS_PORT, ""))
+                    jmDns?.registerService(ServiceInfo.create("_http._tcp.local.", "Sender", 8080, ""))
                 } catch (_: Exception) {}
             }
         }
 
-        // HTTP on 8080 (redirect only) + HTTPS on 8443 (all traffic).
-        // connector/sslConnector are extensions on ApplicationEngineEnvironmentBuilder,
-        // so we build the environment explicitly instead of using the configure lambda.
-        val ks = loadKeyStore()
-        val env = applicationEngineEnvironment {
-            connector { port = HTTP_PORT }
-            sslConnector(
-                keyStore = ks,
-                keyAlias = KEYSTORE_ALIAS,
-                keyStorePassword = { KEYSTORE_PASS.toCharArray() },
-                privateKeyPassword = { KEYSTORE_PASS.toCharArray() }
-            ) { port = HTTPS_PORT }
-            module {
-                install(WebSockets)
-                // Redirect every plain-HTTP request to HTTPS before routing runs
-                intercept(ApplicationCallPipeline.Plugins) {
-                    if (call.request.local.scheme == "http") {
-                        val host = call.request.headers[HttpHeaders.Host]?.substringBefore(':') ?: "localhost"
-                        call.respondRedirect("https://$host:$HTTPS_PORT${call.request.uri}")
-                        finish()
+        // Ktor binds to 0.0.0.0 by default → accepts connections on all interfaces
+        server = embeddedServer(CIO, port = 8080) {
+            install(WebSockets)
+            routing {
+                get("/") {
+                    // Redirect phone.local requests to the actual IP so the browser
+                    // URL bar switches to the IP and WebSocket connects directly.
+                    val host = call.request.headers[HttpHeaders.Host]?.substringBefore(':')
+                    val target = activeMdnsIp.value
+                    if (host == "phone.local" && target != null) {
+                        call.respondRedirect("http://$target:8080/", permanent = false)
+                    } else {
+                        call.respondText(HTML_PAGE, ContentType.Text.Html)
                     }
                 }
-                routing {
-                    get("/") {
-                        // Redirect phone.local → actual IP so the browser URL bar shows the IP
-                        // and WebSocket reconnects to the real address.
-                        val host = call.request.headers[HttpHeaders.Host]?.substringBefore(':')
-                        val target = activeMdnsIp.value
-                        if (host == "phone.local" && target != null) {
-                            call.respondRedirect("https://$target:$HTTPS_PORT/", permanent = false)
-                        } else {
-                            call.respondText(HTML_PAGE, ContentType.Text.Html)
-                        }
-                    }
-                    get("/file")           { serveSharedFile(call, 0) }
-                    get("/file/{index}")   { serveSharedFile(call, call.parameters["index"]?.toIntOrNull() ?: 0) }
-                    post("/upload")        { receiveUpload(call) }
-                    webSocket("/socket") { handleSocket() }
-                }
+                get("/file")           { serveSharedFile(call, 0) }
+                get("/file/{index}")   { serveSharedFile(call, call.parameters["index"]?.toIntOrNull() ?: 0) }
+                post("/upload")        { receiveUpload(call) }
+                webSocket("/socket") { handleSocket() }
             }
         }
-        server = embeddedServer(Netty, env)
         server?.start(wait = false)
     }
 
@@ -642,7 +606,7 @@ class KtorServer(private val context: Context) {
             try {
                 jmDns?.close()
                 jmDns = JmDNS.create(java.net.InetAddress.getByName(ip), "phone")
-                jmDns?.registerService(ServiceInfo.create("_https._tcp.local.", "Sender", HTTPS_PORT, ""))
+                jmDns?.registerService(ServiceInfo.create("_http._tcp.local.", "Sender", 8080, ""))
             } catch (_: Exception) {}
         }
     }

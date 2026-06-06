@@ -25,7 +25,7 @@ androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
 ktor-server-core = { group = "io.ktor", name = "ktor-server-core", version.ref = "ktor" }
-ktor-server-netty = { group = "io.ktor", name = "ktor-server-netty", version.ref = "ktor" }
+ktor-server-cio = { group = "io.ktor", name = "ktor-server-cio", version.ref = "ktor" }
 ktor-server-websockets = { group = "io.ktor", name = "ktor-server-websockets", version.ref = "ktor" }
 jmdns = { group = "org.jmdns", name = "jmdns", version.ref = "jmdns" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }

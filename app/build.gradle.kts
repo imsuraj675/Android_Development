@@ -44,8 +44,6 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
-            excludes += "META-INF/io.netty.versions.properties"
-            excludes += "META-INF/INDEX.LIST"
         }
     }
 }
@@ -61,7 +59,7 @@ dependencies {
     implementation(libs.androidx.activity.compose)
 
     implementation(libs.ktor.server.core)
-    implementation(libs.ktor.server.netty)
+    implementation(libs.ktor.server.cio)
     implementation(libs.ktor.server.websockets)
     implementation(libs.jmdns)
     implementation(libs.zxing.core)

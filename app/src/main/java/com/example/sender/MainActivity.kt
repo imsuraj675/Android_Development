@@ -201,14 +201,14 @@ private fun QrDialog(ifaces: List<NetworkIface>, onDismiss: () -> Unit) {
                 ifaces.forEachIndexed { i, iface ->
                     if (i > 0) { Spacer(Modifier.height(8.dp)); HorizontalDivider(); Spacer(Modifier.height(8.dp)) }
                     Text(iface.label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    QrCodeImage("https://${iface.ip}:8443")
-                    Text("https://${iface.ip}:8443", fontSize = 12.sp, fontFamily = FontFamily.Monospace,
+                    QrCodeImage("http://${iface.ip}:8080")
+                    Text("http://${iface.ip}:8080", fontSize = 12.sp, fontFamily = FontFamily.Monospace,
                         color = MaterialTheme.colorScheme.primary)
                 }
                 if (ifaces.isNotEmpty()) { Spacer(Modifier.height(8.dp)); HorizontalDivider(); Spacer(Modifier.height(8.dp)) }
                 Text("mDNS", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                QrCodeImage("https://phone.local:8443")
-                Text("https://phone.local:8443", fontSize = 12.sp, fontFamily = FontFamily.Monospace,
+                QrCodeImage("http://phone.local:8080")
+                Text("http://phone.local:8080", fontSize = 12.sp, fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.primary)
             }
         },
@@ -659,7 +659,7 @@ fun SenderScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "${iface.label}: https://${iface.ip}:8443",
+                                text = "${iface.label}: http://${iface.ip}:8080",
                                 fontSize = 12.sp,
                                 fontFamily = FontFamily.Monospace,
                                 color = MaterialTheme.colorScheme.primary,
