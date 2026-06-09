@@ -1,12 +1,13 @@
 package com.example.sender
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
-import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
@@ -41,12 +42,17 @@ import kotlinx.coroutines.flow.MutableStateFlow
 // ── MainActivity ──────────────────────────────────────────────────────────────
 
 class MainActivity : ComponentActivity() {
-    private lateinit var server: KtorServer
-    private var multicastLock: WifiManager.MulticastLock? = null
+    private val app get() = application as SenderApp
+    private val server get() = app.server
     private var pendingFileToSave: ReceivedFile? = null
     private var pendingZipStarted = false
-    private val sendAsZipFlow = MutableStateFlow(false)
-    private val pendingMultiFilesFlow = MutableStateFlow<List<Pair<String, Uri>>?>(null)
+    private val sendAsZipFlow          = MutableStateFlow(false)
+    private val pendingMultiFilesFlow  = MutableStateFlow<List<Pair<String, Uri>>?>(null)
+    private val pendingShareFilesFlow  = MutableStateFlow<List<Pair<String, Uri>>?>(null)
+    private val pendingShareTextFlow   = MutableStateFlow<String?>(null)
+
+    private val requestNotifPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* proceed either way */ }
 
     private val pickFiles = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
         if (uris.isEmpty()) return@registerForActivityResult
@@ -80,12 +86,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        server = KtorServer(applicationContext)
 
-        val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-        multicastLock = wifiManager.createMulticastLock("sender_mdns").also { it.acquire() }
+        // Request notification permission (needed for foreground service notification on API 33+)
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestNotifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
 
-        server.start()   // listens on 0.0.0.0 — all interfaces
+        app.startServer()          // idempotent — no-op if already running
+        SenderService.start(this)  // start foreground keepalive (idempotent if already running)
+
+        handleShareIntent(intent)  // handle share intent if launched via share sheet
 
         setContent {
             val ifaces            by server.networkIfaces.collectAsState()
@@ -102,9 +112,12 @@ class MainActivity : ComponentActivity() {
             val outgoingBatch      by server.outgoingBatch.collectAsState()
             val incomingBatch      by server.incomingBatch.collectAsState()
             val pendingMultiFiles  by pendingMultiFilesFlow.collectAsState()
+            val pendingShareFiles  by pendingShareFilesFlow.collectAsState()
+            val pendingShareText   by pendingShareTextFlow.collectAsState()
             val pendingTransfers  by server.pendingTransfers.collectAsState()
             val transferPrefs     by server.transferPrefs.collectAsState()
             val sendAsZip         by sendAsZipFlow.collectAsState()
+            val isServerRunning   by server.isRunning.collectAsState()
 
             SenderScreen(
                 networkIfaces    = ifaces,
@@ -121,9 +134,21 @@ class MainActivity : ComponentActivity() {
                 outgoingBatch    = outgoingBatch,
                 incomingBatch    = incomingBatch,
                 pendingMultiFiles = pendingMultiFiles,
+                pendingShareFiles = pendingShareFiles,
+                pendingShareText  = pendingShareText,
                 pendingTransfers  = pendingTransfers,
                 transferPrefs     = transferPrefs,
                 sendAsZip        = sendAsZip,
+                isServerRunning  = isServerRunning,
+                onToggleServer   = {
+                    if (isServerRunning) {
+                        app.stopServer()
+                        SenderService.stop(this)
+                    } else {
+                        app.startServer()
+                        SenderService.start(this)
+                    }
+                },
                 onToggleSendAsZip = { sendAsZipFlow.value = it },
                 onSend           = { text, ids -> server.sendToDevices(ids, text) },
                 onSendAsFile     = { text, ids -> server.sendTextAsFile(text, ids) },
@@ -143,6 +168,28 @@ class MainActivity : ComponentActivity() {
                     pendingMultiFilesFlow.value = null
                     pendingZipStarted = false
                 },
+                onSendShared     = { files, ids ->
+                    val toShare = files.map { (name, uri) ->
+                        FileToShare(name, getFileSize(uri)) { contentResolver.openInputStream(uri) }
+                    }
+                    if (sendAsZip && toShare.size > 1) {
+                        server.createAndShareZip(
+                            toShare,
+                            "archive_${System.currentTimeMillis()}.zip",
+                            ids
+                        )
+                    } else {
+                        server.shareFiles(toShare, ids)
+                    }
+                    pendingShareFilesFlow.value = null
+                },
+                onDismissShare   = { pendingShareFilesFlow.value = null },
+                onSendSharedText = { sharedText, asFile, ids ->
+                    if (asFile) server.sendTextAsFile(sharedText, ids)
+                    else server.sendToDevices(ids, sharedText)
+                    pendingShareTextFlow.value = null
+                },
+                onDismissShareText = { pendingShareTextFlow.value = null },
                 onCancelFilePick = {
                     server.cancelPendingZip()
                     pendingMultiFilesFlow.value = null
@@ -168,10 +215,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShareIntent(intent)
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        server.stop()
-        multicastLock?.release()
+        // Server lives in SenderApp and SenderService — do not stop it here.
+        // It keeps running in the background until the user explicitly stops it.
     }
 
     private fun getFileName(uri: Uri): String {
@@ -188,6 +241,40 @@ class MainActivity : ComponentActivity() {
             if (col >= 0 && c.moveToFirst()) return c.getLong(col)
         }
         return -1L
+    }
+
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent == null) return
+        // Text share (e.g. selected text, URL, WhatsApp message)
+        if (intent.action == Intent.ACTION_SEND) {
+            val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+            if (sharedText != null && intent.getParcelableExtra(Intent.EXTRA_STREAM, android.net.Uri::class.java) == null) {
+                pendingShareTextFlow.value = sharedText
+                return
+            }
+        }
+        // File share
+        val uris = extractUrisFromIntent(intent) ?: return
+        uris.forEach { uri ->
+            runCatching {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        }
+        pendingShareFilesFlow.value = uris.map { getFileName(it) to it }
+    }
+
+    private fun extractUrisFromIntent(intent: Intent?): List<Uri>? {
+        if (intent == null) return null
+        return when (intent.action) {
+            Intent.ACTION_SEND -> {
+                val uri = intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                listOfNotNull(uri)
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java) ?: emptyList()
+            }
+            else -> null
+        }.takeIf { it?.isNotEmpty() == true }
     }
 }
 
@@ -429,6 +516,188 @@ private fun TargetDeviceDialog(
                 onClick = { onSelect(selectedIds) },
                 enabled = selectedIds.isNotEmpty()
             ) { Text("Send") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+// ── Share target dialog ───────────────────────────────────────────────────────
+
+@Composable
+private fun ShareTargetDialog(
+    files: List<Pair<String, Uri>>,
+    connectedDevices: List<ConnectedDeviceInfo>,
+    isServerRunning: Boolean,
+    onSend: (Set<String>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var selectedIds by remember { mutableStateOf(connectedDevices.map { it.deviceId }.toSet()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                if (files.size == 1) "Share \"${files.first().first}\""
+                else "Share ${files.size} files"
+            )
+        },
+        text = {
+            when {
+                !isServerRunning -> Text("Server is stopped. Tap ▶ Start to run the server first.")
+                connectedDevices.isEmpty() -> Text("No devices connected. Open the URL on another device to connect.")
+                connectedDevices.size == 1 -> Text("Send to ${connectedDevices.first().alias}?")
+                else -> Column {
+                    Text("Send to:", fontSize = 13.sp,
+                        modifier = Modifier.padding(bottom = 6.dp))
+                    LazyColumn {
+                        items(connectedDevices, key = { it.deviceId }) { d ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        selectedIds = if (d.deviceId in selectedIds)
+                                            selectedIds - d.deviceId else selectedIds + d.deviceId
+                                    }
+                                    .padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = d.deviceId in selectedIds,
+                                    onCheckedChange = { checked ->
+                                        selectedIds = if (checked) selectedIds + d.deviceId
+                                                      else selectedIds - d.deviceId
+                                    }
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Column {
+                                    Text(d.alias, fontSize = 14.sp)
+                                    Text(d.ip, fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (isServerRunning && connectedDevices.isNotEmpty()) {
+                Button(
+                    onClick = {
+                        val targets = if (connectedDevices.size == 1)
+                            setOf(connectedDevices.first().deviceId)
+                        else selectedIds
+                        if (targets.isNotEmpty()) onSend(targets)
+                    },
+                    enabled = connectedDevices.size == 1 || selectedIds.isNotEmpty()
+                ) { Text("Send") }
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+// ── Share text dialog ─────────────────────────────────────────────────────────
+
+@Composable
+private fun ShareTextDialog(
+    text: String,
+    connectedDevices: List<ConnectedDeviceInfo>,
+    isServerRunning: Boolean,
+    onSend: (asFile: Boolean, targets: Set<String>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var sendAsFile  by remember { mutableStateOf(false) }
+    var selectedIds by remember { mutableStateOf(connectedDevices.map { it.deviceId }.toSet()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Share text") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                when {
+                    !isServerRunning -> Text("Server is stopped. Tap ▶ Start to run the server first.")
+                    connectedDevices.isEmpty() -> Text("No devices connected. Open the URL on another device to connect.")
+                    else -> {
+                        // Text preview (scrollable, capped)
+                        val preview = if (text.length > 400) text.take(400) + "…" else text
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            shape = MaterialTheme.shapes.small
+                        ) {
+                            Text(
+                                text = preview,
+                                fontSize = 13.sp,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 130.dp)
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(8.dp)
+                            )
+                        }
+
+                        // Send mode toggle
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FilterChip(
+                                selected = !sendAsFile,
+                                onClick  = { sendAsFile = false },
+                                label    = { Text("As text", fontSize = 12.sp) }
+                            )
+                            FilterChip(
+                                selected = sendAsFile,
+                                onClick  = { sendAsFile = true },
+                                label    = { Text("As .txt file", fontSize = 12.sp) }
+                            )
+                        }
+
+                        // Device selection when multiple connected
+                        if (connectedDevices.size > 1) {
+                            Text("Send to:", fontSize = 13.sp)
+                            LazyColumn(modifier = Modifier.heightIn(max = 150.dp)) {
+                                items(connectedDevices, key = { it.deviceId }) { d ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                selectedIds = if (d.deviceId in selectedIds)
+                                                    selectedIds - d.deviceId else selectedIds + d.deviceId
+                                            }
+                                            .padding(vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Checkbox(
+                                            checked = d.deviceId in selectedIds,
+                                            onCheckedChange = { checked ->
+                                                selectedIds = if (checked) selectedIds + d.deviceId
+                                                              else selectedIds - d.deviceId
+                                            }
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Column {
+                                            Text(d.alias, fontSize = 14.sp)
+                                            Text(d.ip, fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (isServerRunning && connectedDevices.isNotEmpty()) {
+                Button(
+                    onClick = {
+                        val targets = if (connectedDevices.size == 1)
+                            setOf(connectedDevices.first().deviceId)
+                        else selectedIds
+                        if (targets.isNotEmpty()) onSend(sendAsFile, targets)
+                    },
+                    enabled = connectedDevices.size == 1 || selectedIds.isNotEmpty()
+                ) { Text("Send") }
+            }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
@@ -681,14 +950,22 @@ fun SenderScreen(
     outgoingBatch: TransferBatch?,
     incomingBatch: Map<String, TransferBatch>,
     pendingMultiFiles: List<Pair<String, Uri>>?,
+    pendingShareFiles: List<Pair<String, Uri>>?,
+    pendingShareText: String?,
     pendingTransfers: List<IncomingTransfer>,
     transferPrefs: TransferPrefs,
     sendAsZip: Boolean,
+    isServerRunning: Boolean,
+    onToggleServer: () -> Unit,
     onToggleSendAsZip: (Boolean) -> Unit,
     onSend: (String, Set<String>) -> Unit,
     onSendAsFile: (String, Set<String>) -> Unit,
     onPickFile: () -> Unit,
     onSendFiles: (List<Pair<String, Uri>>, Set<String>) -> Unit,
+    onSendShared: (List<Pair<String, Uri>>, Set<String>) -> Unit,
+    onDismissShare: () -> Unit,
+    onSendSharedText: (String, Boolean, Set<String>) -> Unit,
+    onDismissShareText: () -> Unit,
     onCancelFilePick: () -> Unit,
     onSaveFile: (ReceivedFile) -> Unit,
     onDiscardFile: (ReceivedFile) -> Unit,
@@ -778,6 +1055,26 @@ fun SenderScreen(
         )
     }
 
+    if (pendingShareFiles != null) {
+        ShareTargetDialog(
+            files            = pendingShareFiles,
+            connectedDevices = connectedDevices,
+            isServerRunning  = isServerRunning,
+            onSend           = { ids -> onSendShared(pendingShareFiles, ids) },
+            onDismiss        = onDismissShare
+        )
+    }
+
+    if (pendingShareText != null) {
+        ShareTextDialog(
+            text             = pendingShareText,
+            connectedDevices = connectedDevices,
+            isServerRunning  = isServerRunning,
+            onSend           = { asFile, ids -> onSendSharedText(pendingShareText, asFile, ids) },
+            onDismiss        = onDismissShareText
+        )
+    }
+
     // ── Helper: resolve send target ──────────────────────────────────────────
 
     fun triggerSend(action: String) {
@@ -810,6 +1107,22 @@ fun SenderScreen(
                 ) {
                     Text("Sender", fontSize = 22.sp)
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        // Server start/stop toggle
+                        Button(
+                            onClick = onToggleServer,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isServerRunning)
+                                    MaterialTheme.colorScheme.error
+                                else
+                                    MaterialTheme.colorScheme.primary
+                            ),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                if (isServerRunning) "■ Stop" else "▶ Start",
+                                fontSize = 12.sp
+                            )
+                        }
                         OutlinedButton(
                             onClick = { showSettings = true },
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)

@@ -909,6 +909,7 @@ class KtorServer(private val context: Context) {
     val zipProgress      = MutableStateFlow<Float?>(null)
     val outgoingBatch    = MutableStateFlow<TransferBatch?>(null)
     val incomingBatch    = MutableStateFlow<Map<String, TransferBatch>>(emptyMap())
+    val isRunning        = MutableStateFlow(false)
     val pendingTransfers = MutableStateFlow<List<IncomingTransfer>>(emptyList())
     val transferPrefs    = MutableStateFlow(TransferPrefs())
 
@@ -918,6 +919,8 @@ class KtorServer(private val context: Context) {
     // ── Start / stop ─────────────────────────────────────────────────────────
 
     fun start() {
+        if (isRunning.value) return
+        isRunning.value = true
         val ifaces = getNetworkIfaces()
         networkIfaces.value = ifaces
         trustedDevices.value = deviceManager.getAll()
@@ -961,6 +964,8 @@ class KtorServer(private val context: Context) {
     }
 
     fun stop() {
+        if (!isRunning.value) return
+        isRunning.value = false
         jmDns?.close()
         server?.stop(0L, 0L)
     }
