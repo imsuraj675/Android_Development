@@ -3,6 +3,7 @@ package com.example.sender
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.net.wifi.WifiManager
@@ -17,13 +18,16 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -40,18 +44,28 @@ class MainActivity : ComponentActivity() {
     private lateinit var server: KtorServer
     private var multicastLock: WifiManager.MulticastLock? = null
     private var pendingFileToSave: ReceivedFile? = null
-    private var pendingFileTargetIds: Set<String>? = null
+    private var pendingZipStarted = false
+    private val sendAsZipFlow = MutableStateFlow(false)
     private val pendingMultiFilesFlow = MutableStateFlow<List<Pair<String, Uri>>?>(null)
 
     private val pickFiles = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
-        if (uris.isEmpty()) { pendingFileTargetIds = null; return@registerForActivityResult }
-        if (uris.size == 1) {
-            val uri = uris.first()
-            server.shareFile(getFileName(uri), getFileSize(uri), { contentResolver.openInputStream(uri) }, pendingFileTargetIds)
-            pendingFileTargetIds = null
-        } else {
-            pendingMultiFilesFlow.value = uris.map { getFileName(it) to it }
-            // pendingFileTargetIds held until dialog is resolved
+        if (uris.isEmpty()) return@registerForActivityResult
+        val files = uris.map { getFileName(it) to it }
+        pendingZipStarted = uris.size > 1 && sendAsZipFlow.value
+        if (pendingZipStarted) {
+            val toShare = uris.map { uri ->
+                FileToShare(getFileName(uri), getFileSize(uri)) { contentResolver.openInputStream(uri) }
+            }
+            server.startBackgroundZip(toShare, "archive_${System.currentTimeMillis()}.zip")
+        }
+        pendingMultiFilesFlow.value = files
+    }
+
+    private val pickFolder = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+        if (uri != null) {
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            contentResolver.takePersistableUriPermission(uri, flags)
+            server.updateDownloadLocation(uri.toString())
         }
     }
 
@@ -74,17 +88,23 @@ class MainActivity : ComponentActivity() {
         server.start()   // listens on 0.0.0.0 — all interfaces
 
         setContent {
-            val ifaces           by server.networkIfaces.collectAsState()
-            val activeMdnsIp     by server.activeMdnsIp.collectAsState()
-            val count            by server.clientCount.collectAsState()
-            val connected        by server.connectedDevices.collectAsState()
-            val pending          by server.pendingPairings.collectAsState()
-            val trusted          by server.trustedDevices.collectAsState()
-            val received         by server.receivedMessages.collectAsState()
-            val receivedFiles    by server.receivedFiles.collectAsState()
-            val activeTransfers  by server.activeTransfers.collectAsState()
-            val zipProgress      by server.zipProgress.collectAsState()
-            val pendingMultiFiles by pendingMultiFilesFlow.collectAsState()
+            val ifaces            by server.networkIfaces.collectAsState()
+            val activeMdnsIp      by server.activeMdnsIp.collectAsState()
+            val count             by server.clientCount.collectAsState()
+            val connected         by server.connectedDevices.collectAsState()
+            val pending           by server.pendingPairings.collectAsState()
+            val trusted           by server.trustedDevices.collectAsState()
+            val received          by server.receivedMessages.collectAsState()
+            val receivedFiles     by server.receivedFiles.collectAsState()
+            val activeTransfers    by server.activeTransfers.collectAsState()
+            val incomingTransfers  by server.incomingTransfers.collectAsState()
+            val zipProgress        by server.zipProgress.collectAsState()
+            val outgoingBatch      by server.outgoingBatch.collectAsState()
+            val incomingBatch      by server.incomingBatch.collectAsState()
+            val pendingMultiFiles  by pendingMultiFilesFlow.collectAsState()
+            val pendingTransfers  by server.pendingTransfers.collectAsState()
+            val transferPrefs     by server.transferPrefs.collectAsState()
+            val sendAsZip         by sendAsZipFlow.collectAsState()
 
             SenderScreen(
                 networkIfaces    = ifaces,
@@ -95,37 +115,38 @@ class MainActivity : ComponentActivity() {
                 trustedDevices   = trusted,
                 received         = received,
                 receivedFiles    = receivedFiles,
-                activeTransfers  = activeTransfers,
+                activeTransfers   = activeTransfers,
+                incomingTransfers = incomingTransfers,
                 zipProgress      = zipProgress,
+                outgoingBatch    = outgoingBatch,
+                incomingBatch    = incomingBatch,
                 pendingMultiFiles = pendingMultiFiles,
+                pendingTransfers  = pendingTransfers,
+                transferPrefs     = transferPrefs,
+                sendAsZip        = sendAsZip,
+                onToggleSendAsZip = { sendAsZipFlow.value = it },
                 onSend           = { text, ids -> server.sendToDevices(ids, text) },
                 onSendAsFile     = { text, ids -> server.sendTextAsFile(text, ids) },
-                onPickFile       = { ids ->
-                    pendingFileTargetIds = ids
-                    pickFiles.launch("*/*")
-                },
-                onSendFilesIndividual = { files ->
-                    val ids = pendingFileTargetIds
-                    val toShare = files.map { (name, uri) ->
-                        FileToShare(name, getFileSize(uri)) { contentResolver.openInputStream(uri) }
+                onPickFile       = { pickFiles.launch("*/*") },
+                onSendFiles      = { files, ids ->
+                    if (pendingZipStarted) {
+                        server.sendPendingZip(ids)
+                    } else if (files.size == 1) {
+                        val (name, uri) = files.first()
+                        server.shareFile(name, getFileSize(uri), { contentResolver.openInputStream(uri) }, ids)
+                    } else {
+                        val toShare = files.map { (name, uri) ->
+                            FileToShare(name, getFileSize(uri)) { contentResolver.openInputStream(uri) }
+                        }
+                        server.shareFiles(toShare, ids)
                     }
-                    server.shareFiles(toShare, ids)
                     pendingMultiFilesFlow.value = null
-                    pendingFileTargetIds = null
+                    pendingZipStarted = false
                 },
-                onSendFilesAsZip = { files ->
-                    val ids = pendingFileTargetIds
-                    val zipName = "archive_${System.currentTimeMillis()}.zip"
-                    val toShare = files.map { (name, uri) ->
-                        FileToShare(name, getFileSize(uri)) { contentResolver.openInputStream(uri) }
-                    }
-                    server.createAndShareZip(toShare, zipName, ids)
+                onCancelFilePick = {
+                    server.cancelPendingZip()
                     pendingMultiFilesFlow.value = null
-                    pendingFileTargetIds = null
-                },
-                onDismissMultiFiles = {
-                    pendingMultiFilesFlow.value = null
-                    pendingFileTargetIds = null
+                    pendingZipStarted = false
                 },
                 onSaveFile       = { f -> pendingFileToSave = f; saveFile.launch(f.name) },
                 onDiscardFile    = { f -> server.discardFile(f.id) },
@@ -138,7 +159,11 @@ class MainActivity : ComponentActivity() {
                 onRenameDevice       = { id, alias -> server.renameDevice(id, alias) },
                 onForgetDevice       = { id -> server.forgetDevice(id) },
                 onToggleBlockDevice  = { id -> server.toggleBlockDevice(id) },
-                onSwitchMdns         = { ip -> server.switchMdnsTo(ip) }
+                onSwitchMdns         = { ip -> server.switchMdnsTo(ip) },
+                onAcceptTransfer     = { id -> server.acceptTransfer(id) },
+                onRejectTransfer     = { id -> server.rejectTransfer(id) },
+                onSaveTransferPrefs  = { prefs -> server.updateTransferPrefs(prefs) },
+                onPickDownloadFolder = { pickFolder.launch(null) }
             )
         }
     }
@@ -526,6 +551,118 @@ private fun formatBytes(bytes: Long): String = when {
     else                   -> "${"%.2f".format(bytes / 1_073_741_824f)}GB"
 }
 
+private fun uriDisplayPath(uriString: String): String = try {
+    val last = Uri.parse(uriString).lastPathSegment ?: return uriString
+    "/" + Uri.decode(last).substringAfter(':')
+} catch (_: Exception) { uriString }
+
+// ── Transfer approval dialog ──────────────────────────────────────────────────
+
+@Composable
+private fun TransferApprovalDialog(
+    transfer: IncomingTransfer,
+    onAccept: () -> Unit,
+    onReject: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = { /* force explicit choice */ },
+        title = { Text("Incoming Transfer") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("${transfer.deviceAlias} wants to send ${transfer.files.size} file(s)")
+                Text(
+                    "Total: ${formatBytes(transfer.totalBytes)}",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (transfer.files.isNotEmpty()) {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                    LazyColumn(modifier = Modifier.heightIn(max = 200.dp)) {
+                        items(transfer.files) { f ->
+                            Text(
+                                "• ${f.name}  (${formatBytes(f.size)})",
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(vertical = 1.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = onAccept) { Text("Accept") } },
+        dismissButton = {
+            OutlinedButton(
+                onClick = onReject,
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+            ) { Text("Reject") }
+        }
+    )
+}
+
+// ── Settings dialog ───────────────────────────────────────────────────────────
+
+@Composable
+private fun SettingsDialog(
+    prefs: TransferPrefs,
+    onSave: (TransferPrefs) -> Unit,
+    onPickFolder: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var autoDownload by remember { mutableStateOf(prefs.autoDownload) }
+    var thresholdMb  by remember { mutableStateOf((prefs.approvalThresholdBytes / 1_048_576L).toString()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Transfer Settings") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Auto-download", fontSize = 14.sp)
+                    Switch(checked = autoDownload, onCheckedChange = { autoDownload = it })
+                }
+                OutlinedTextField(
+                    value = thresholdMb,
+                    onValueChange = { thresholdMb = it },
+                    label = { Text("Approval threshold (MB)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Download folder", fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        prefs.downloadLocationUri?.let { uriDisplayPath(it) }
+                            ?: "Default (Downloads/LocalShare)",
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    OutlinedButton(
+                        onClick = onPickFolder,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                    ) { Text("Choose Folder", fontSize = 12.sp) }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val mb = thresholdMb.toLongOrNull()?.coerceAtLeast(1L) ?: 50L
+                onSave(prefs.copy(
+                    autoDownload = autoDownload,
+                    approvalThresholdBytes = mb * 1_048_576L
+                ))
+                onDismiss()
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
 // ── SenderScreen ──────────────────────────────────────────────────────────────
 
 @Composable
@@ -539,14 +676,20 @@ fun SenderScreen(
     received: List<ReceivedMessage>,
     receivedFiles: List<ReceivedFile>,
     activeTransfers: List<TransferProgress>,
+    incomingTransfers: List<TransferProgress>,
     zipProgress: Float?,
+    outgoingBatch: TransferBatch?,
+    incomingBatch: Map<String, TransferBatch>,
     pendingMultiFiles: List<Pair<String, Uri>>?,
+    pendingTransfers: List<IncomingTransfer>,
+    transferPrefs: TransferPrefs,
+    sendAsZip: Boolean,
+    onToggleSendAsZip: (Boolean) -> Unit,
     onSend: (String, Set<String>) -> Unit,
     onSendAsFile: (String, Set<String>) -> Unit,
-    onPickFile: (Set<String>) -> Unit,
-    onSendFilesIndividual: (List<Pair<String, Uri>>) -> Unit,
-    onSendFilesAsZip: (List<Pair<String, Uri>>) -> Unit,
-    onDismissMultiFiles: () -> Unit,
+    onPickFile: () -> Unit,
+    onSendFiles: (List<Pair<String, Uri>>, Set<String>) -> Unit,
+    onCancelFilePick: () -> Unit,
     onSaveFile: (ReceivedFile) -> Unit,
     onDiscardFile: (ReceivedFile) -> Unit,
     onCopyText: (String) -> Unit,
@@ -555,11 +698,16 @@ fun SenderScreen(
     onRenameDevice: (String, String) -> Unit,
     onForgetDevice: (String) -> Unit,
     onToggleBlockDevice: (String) -> Unit,
-    onSwitchMdns: (String) -> Unit
+    onSwitchMdns: (String) -> Unit,
+    onAcceptTransfer: (String) -> Unit,
+    onRejectTransfer: (String) -> Unit,
+    onSaveTransferPrefs: (TransferPrefs) -> Unit,
+    onPickDownloadFolder: () -> Unit
 ) {
     var text          by remember { mutableStateOf("") }
     var showQr        by remember { mutableStateOf(false) }
     var showDevices   by remember { mutableStateOf(false) }
+    var showSettings  by remember { mutableStateOf(false) }
     var pendingAction by remember { mutableStateOf<String?>(null) }
 
     // ── Dialogs ──────────────────────────────────────────────────────────────
@@ -575,11 +723,26 @@ fun SenderScreen(
         onDismiss     = { showDevices = false }
     )
 
+    if (showSettings) SettingsDialog(
+        prefs         = transferPrefs,
+        onSave        = onSaveTransferPrefs,
+        onPickFolder  = onPickDownloadFolder,
+        onDismiss     = { showSettings = false }
+    )
+
     pendingPairings.firstOrNull()?.let { req ->
         PairingDialog(
             request  = req,
             onAccept = { alias -> onAcceptPairing(req.deviceId, alias) },
             onReject = { onRejectPairing(req.deviceId) }
+        )
+    }
+
+    pendingTransfers.firstOrNull()?.let { transfer ->
+        TransferApprovalDialog(
+            transfer = transfer,
+            onAccept = { onAcceptTransfer(transfer.transferId) },
+            onReject = { onRejectTransfer(transfer.transferId) }
         )
     }
 
@@ -589,7 +752,6 @@ fun SenderScreen(
             onSelect = { ids ->
                 when (pendingAction) {
                     "text"   -> { onSend(text, ids); text = "" }
-                    "file"   -> onPickFile(ids)
                     "asFile" -> { onSendAsFile(text, ids); text = "" }
                 }
                 pendingAction = null
@@ -598,12 +760,21 @@ fun SenderScreen(
         )
     }
 
-    if (pendingMultiFiles != null) {
-        MultiFileSendDialog(
-            files           = pendingMultiFiles,
-            onSendIndividual = { onSendFilesIndividual(pendingMultiFiles) },
-            onSendAsZip      = { onSendFilesAsZip(pendingMultiFiles) },
-            onDismiss        = onDismissMultiFiles
+    // Auto-send or show device picker when files have been picked
+    LaunchedEffect(pendingMultiFiles) {
+        val files = pendingMultiFiles ?: return@LaunchedEffect
+        when (connectedDevices.size) {
+            0    -> onCancelFilePick()
+            1    -> onSendFiles(files, setOf(connectedDevices.first().deviceId))
+            // else: TargetDeviceDialog below handles it
+        }
+    }
+
+    if (pendingMultiFiles != null && connectedDevices.size > 1) {
+        TargetDeviceDialog(
+            devices   = connectedDevices,
+            onSelect  = { ids -> onSendFiles(pendingMultiFiles!!, ids) },
+            onDismiss = onCancelFilePick
         )
     }
 
@@ -616,7 +787,6 @@ fun SenderScreen(
                 val ids = setOf(connectedDevices.first().deviceId)
                 when (action) {
                     "text"   -> { onSend(text, ids); text = "" }
-                    "file"   -> onPickFile(ids)
                     "asFile" -> { onSendAsFile(text, ids); text = "" }
                 }
             }
@@ -640,6 +810,10 @@ fun SenderScreen(
                 ) {
                     Text("Sender", fontSize = 22.sp)
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OutlinedButton(
+                            onClick = { showSettings = true },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        ) { Text("Settings", fontSize = 12.sp) }
                         OutlinedButton(
                             onClick = { showDevices = true },
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
@@ -713,6 +887,32 @@ fun SenderScreen(
                     }
                 }
 
+                // Auto-download folder warning
+                if (transferPrefs.autoDownload && transferPrefs.downloadLocationUri == null) {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "No download folder set — files save to Downloads/LocalShare",
+                                fontSize = 11.sp,
+                                modifier = Modifier.weight(1f),
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            TextButton(
+                                onClick = onPickDownloadFolder,
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) { Text("Set Folder", fontSize = 11.sp) }
+                        }
+                    }
+                }
+
                 // Message input
                 OutlinedTextField(
                     value = text,
@@ -735,11 +935,22 @@ fun SenderScreen(
                         modifier = Modifier.weight(1f),
                         enabled  = text.isNotBlank() && clientCount > 0
                     ) { Text("As File") }
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Checkbox(
+                        checked = sendAsZip,
+                        onCheckedChange = onToggleSendAsZip,
+                        enabled = clientCount > 0
+                    )
+                    Text("ZIP", fontSize = 12.sp, modifier = Modifier.weight(1f))
                     OutlinedButton(
-                        onClick  = { triggerSend("file") },
-                        modifier = Modifier.weight(1f),
+                        onClick  = { onPickFile() },
                         enabled  = clientCount > 0
-                    ) { Text("File…") }
+                    ) { Text("Send File…") }
                 }
 
                 // ZIP creation progress
@@ -763,9 +974,22 @@ fun SenderScreen(
                     }
                 }
 
-                // Active download progress bars
-                if (activeTransfers.isNotEmpty()) {
+                // Outgoing transfer progress bars (phone → browser)
+                if (activeTransfers.isNotEmpty() || outgoingBatch != null) {
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Sending", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (outgoingBatch != null && outgoingBatch.total > 1) {
+                                Text(
+                                    "${outgoingBatch.done} / ${outgoingBatch.total} files · ${outgoingBatch.remaining} remaining",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
                         activeTransfers.forEach { t ->
                             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Row(
@@ -789,6 +1013,63 @@ fun SenderScreen(
                                     progress = { t.fraction },
                                     modifier = Modifier.fillMaxWidth()
                                 )
+                            }
+                        }
+                    }
+                }
+
+                // Incoming transfer progress bars (browser → phone)
+                val incomingBatchAgg = if (incomingBatch.isNotEmpty()) {
+                    TransferBatch(
+                        total = incomingBatch.values.sumOf { it.total },
+                        done  = incomingBatch.values.sumOf { it.done }
+                    )
+                } else null
+                if (incomingTransfers.isNotEmpty() || incomingBatchAgg != null) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Receiving", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (incomingBatchAgg != null && incomingBatchAgg.total > 1) {
+                                Text(
+                                    "${incomingBatchAgg.done} / ${incomingBatchAgg.total} files · ${incomingBatchAgg.remaining} remaining",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        incomingTransfers.forEach { t ->
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = t.name,
+                                        fontSize = 11.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Text(
+                                        text = if (t.totalBytes > 0)
+                                            "${formatBytes(t.bytesSent)} / ${formatBytes(t.totalBytes)}"
+                                        else
+                                            formatBytes(t.bytesSent),
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                if (t.totalBytes > 0) {
+                                    LinearProgressIndicator(
+                                        progress = { t.fraction },
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                } else {
+                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                }
                             }
                         }
                     }

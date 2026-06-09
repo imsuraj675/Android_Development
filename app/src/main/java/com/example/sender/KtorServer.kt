@@ -1,6 +1,10 @@
 package com.example.sender
 
+import android.content.ContentValues
 import android.content.Context
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 import io.ktor.http.*
 import io.ktor.http.content.PartData
 import io.ktor.http.content.forEachPart
@@ -17,16 +21,20 @@ import io.ktor.websocket.*
 import com.example.sender.BuildConfig
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.InputStream
 import java.net.Inet4Address
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import javax.jmdns.JmDNS
 import javax.jmdns.ServiceInfo
@@ -68,6 +76,15 @@ data class FileToShare(
     val openStream: () -> InputStream?
 )
 
+data class IncomingTransfer(
+    val transferId: String,
+    val deviceAlias: String,
+    val files: List<FileEntry>,
+    val totalBytes: Long
+) {
+    data class FileEntry(val name: String, val size: Long)
+}
+
 data class TransferProgress(
     val id: String,
     val name: String,
@@ -76,6 +93,10 @@ data class TransferProgress(
 ) {
     val fraction: Float
         get() = if (totalBytes > 0) (bytesSent.toFloat() / totalBytes).coerceIn(0f, 1f) else 0f
+}
+
+data class TransferBatch(val total: Int, val done: Int) {
+    val remaining: Int get() = (total - done).coerceAtLeast(0)
 }
 
 // ── Network interface enumeration ─────────────────────────────────────────────
@@ -201,6 +222,24 @@ private val HTML_PAGE = """
                 border: 1px solid #444; border-radius: 4px; cursor: pointer; white-space: nowrap; }
   #upload-btn:hover { background: #3a3a3a; }
   #upload-status { font-size: .8rem; color: #4caf50; width: 100%; }
+
+  /* ── download bar ── */
+  #dl-bar { display:flex; align-items:center; justify-content:space-between;
+            background:#161616; border:1px solid #2a2a2a; border-radius:6px;
+            padding:8px 12px; margin-bottom:10px; flex-wrap:wrap; gap:8px; }
+  #dl-info { display:flex; align-items:center; gap:6px; font-size:0.82rem; color:#888; }
+  #dl-path { color:#4caf50; font-size:0.82rem; }
+  #dl-change { padding:2px 8px; font-size:0.75rem; background:#2a2a2a;
+               color:#aaa; border:1px solid #444; border-radius:3px; cursor:pointer; }
+  #dl-change:hover { background:#3a3a3a; }
+  #auto-dl-label { display:flex; align-items:center; gap:5px; cursor:pointer;
+                   font-size:0.82rem; color:#ccc; }
+  #dl-warn { background:#2a1500; border:1px solid #5a3800; border-radius:6px;
+             padding:8px 12px; font-size:0.8rem; color:#ffcc66; margin-bottom:8px; display:none; }
+  progress.file-dl-progress { width:100%; height:4px; margin:4px 0; display:none; accent-color:#42a5f5; }
+  #upload-progress { width:100%; height:8px; display:none; accent-color:#4caf50; border-radius:4px; }
+  #batch-status { font-size:0.78rem; color:#888; padding:4px 0 6px; display:none; }
+  #zip-ul-label { display:flex; align-items:center; gap:4px; font-size:0.82rem; color:#ccc; cursor:pointer; white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -218,9 +257,15 @@ private val HTML_PAGE = """
 <div id="main-ui" hidden>
   <h1>Receiver</h1>
   <div id="status">Connected</div>
-  <div class="toolbar">
-    <button onclick="requestNotify()">Enable Notifications</button>
+  <div id="dl-bar">
+    <div id="dl-info">📁 Save to: <span id="dl-path">Downloads folder</span>
+      <button id="dl-change" onclick="chooseFolder()">Change</button>
+    </div>
+    <label id="auto-dl-label">
+      <input type="checkbox" id="auto-dl"> Auto-download
+    </label>
   </div>
+  <div id="batch-status"></div>
   <ul id="messages"></ul>
   <div id="reply-area">
     <textarea id="reply-input" placeholder="Reply to phone… (Ctrl+Enter to send)"></textarea>
@@ -232,8 +277,10 @@ private val HTML_PAGE = """
   <div id="upload-area">
     <label>Send file to phone:</label>
     <input type="file" id="file-input" multiple>
+    <label id="zip-ul-label"><input type="checkbox" id="zip-upload"> ZIP</label>
     <button id="upload-btn" onclick="uploadFiles()">Upload</button>
     <span id="upload-status"></span>
+    <progress id="upload-progress" max="100" value="0"></progress>
   </div>
 </div>
 
@@ -267,6 +314,8 @@ private val HTML_PAGE = """
   /* ── state machine ── */
   let appState = 'connecting';
   let pairingTimer = null;
+  const pendingTransferCallbacks = new Map();
+  let dirHandle = null;
 
   function setAppState(s) {
     appState = s;
@@ -333,7 +382,21 @@ private val HTML_PAGE = """
     if (msg.type === 'rejected')  { setAppState('rejected'); return; }
     if (msg.type === 'kicked')    { setAppState('kicked');   return; }
     if (msg.type === 'text')      { addText(msg.data, msg.from || 'Phone'); return; }
+    if (msg.type === 'file_batch') {
+      _batchTotal = parseInt(msg.count) || 0; _batchReceived = 0;
+      updateBatchStatus(); return;
+    }
     if (msg.type === 'file')      { addFile(msg.name, parseInt(msg.index) || 0); return; }
+    if (msg.type === 'transfer_accept') {
+      const cb = pendingTransferCallbacks.get(msg.transferId);
+      if (cb) cb(true);
+      return;
+    }
+    if (msg.type === 'transfer_reject') {
+      const cb = pendingTransferCallbacks.get(msg.transferId);
+      if (cb) cb(false);
+      return;
+    }
   };
 
   /* ── auto-expand textarea ── */
@@ -429,36 +492,181 @@ private val HTML_PAGE = """
     actions.appendChild(copyBtn); actions.appendChild(saveTxtBtn);
     li.appendChild(actions);
     messages.prepend(li);
+  }
 
-    if (Notification.permission === 'granted')
-      new Notification('Sender', { body: text.slice(0, 100) });
+  /* ── batch download status ── */
+  let _batchTotal = 0, _batchReceived = 0;
+
+  function updateBatchStatus() {
+    const el = document.getElementById('batch-status');
+    if (_batchTotal <= 1) { el.style.display = 'none'; return; }
+    const queued = _dlQueue.length + _dlActive;
+    el.textContent = 'Received ' + _batchReceived + ' / ' + _batchTotal + ' files'
+      + (queued > 0 ? ' · ' + queued + ' downloading' : ' · done');
+    el.style.display = 'block';
+    if (_batchReceived >= _batchTotal && queued === 0) {
+      setTimeout(() => { el.style.display = 'none'; _batchTotal = 0; _batchReceived = 0; }, 3000);
+    }
+  }
+
+  /* ── ZIP creation (pure JS, no external libraries, STORED method) ── */
+  const _crcT = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    _crcT[i] = c >>> 0;
+  }
+  function _crc32(buf) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < buf.length; i++) c = _crcT[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  async function createZipBlob(files, onProgress) {
+    const enc = new TextEncoder();
+    const parts = [], central = [];
+    let offset = 0;
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const nb = enc.encode(f.name);
+      const data = new Uint8Array(await f.arrayBuffer());
+      const crc = _crc32(data), sz = data.length;
+      const lh = new Uint8Array(30 + nb.length);
+      const ld = new DataView(lh.buffer);
+      ld.setUint32(0, 0x04034b50, true); ld.setUint16(4, 20, true);
+      ld.setUint32(14, crc, true); ld.setUint32(18, sz, true); ld.setUint32(22, sz, true);
+      ld.setUint16(26, nb.length, true); lh.set(nb, 30);
+      const ce = new Uint8Array(46 + nb.length);
+      const cd = new DataView(ce.buffer);
+      cd.setUint32(0, 0x02014b50, true); cd.setUint16(4, 20, true); cd.setUint16(6, 20, true);
+      cd.setUint32(16, crc, true); cd.setUint32(20, sz, true); cd.setUint32(24, sz, true);
+      cd.setUint16(28, nb.length, true); cd.setUint32(42, offset, true); ce.set(nb, 46);
+      parts.push(lh, data); central.push(ce);
+      offset += lh.length + sz;
+      if (onProgress) onProgress((i + 1) / files.length);
+    }
+    const cdSz = central.reduce((s, e) => s + e.length, 0);
+    const eocd = new Uint8Array(22);
+    const ev = new DataView(eocd.buffer);
+    ev.setUint32(0, 0x06054b50, true);
+    ev.setUint16(8, files.length, true); ev.setUint16(10, files.length, true);
+    ev.setUint32(12, cdSz, true); ev.setUint32(16, offset, true);
+    return new Blob([...parts, ...central, eocd], { type: 'application/zip' });
+  }
+
+  /* ── download queue ──────────────────────────────────────────────────────────
+     Browsers block programmatic <a>.click() downloads after ~10 rapid calls.
+     Queue ensures downloads go one-at-a-time for native downloads (no FSA) and
+     at most 3 concurrent streams for FSA, so no browser download limit is hit.
+  ─────────────────────────────────────────────────────────────────────────── */
+  const _dlQueue = [];
+  let _dlActive = 0;
+  const _DL_CONCURRENCY = 3;
+
+  async function _runDlTask(task) {
+    try { await triggerDownload(task.name, task.index, task.progressEl); } catch(_) {}
+    if (!dirHandle) await new Promise(r => setTimeout(r, 350));
+    _dlActive--;
+    _drainDlQueue();
+    updateBatchStatus();
+  }
+
+  function _drainDlQueue() {
+    const maxSlots = dirHandle ? _DL_CONCURRENCY : 1;
+    while (_dlActive < maxSlots && _dlQueue.length > 0) {
+      _dlActive++;
+      _runDlTask(_dlQueue.shift());
+    }
+  }
+
+  function queueDownload(name, index, progressEl) {
+    console.log('[dl-queue] enqueue', name, 'index=' + index, 'queued=' + (_dlQueue.length + 1), 'active=' + _dlActive);
+    _dlQueue.push({ name, index, progressEl });
+    _drainDlQueue();
+  }
+
+  /* ── download helpers ── */
+  async function triggerDownload(name, index, progressEl) {
+    if (dirHandle) {
+      // FSA folder chosen: stream directly into the file, no RAM buffering
+      if (progressEl) { progressEl.style.display = 'block'; progressEl.value = 0; }
+      let writable;
+      try {
+        const resp = await fetch('/file/' + index);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const total = parseInt(resp.headers.get('content-length') || '0');
+        const fh = await dirHandle.getFileHandle(name, { create: true });
+        writable = await fh.createWritable();
+        const reader = resp.body.getReader();
+        let rcv = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await writable.write(value);
+          rcv += value.length;
+          if (total > 0 && progressEl) progressEl.value = rcv / total * 100;
+        }
+        await writable.close();
+        if (progressEl) { progressEl.value = 100; setTimeout(() => progressEl.style.display = 'none', 500); }
+      } catch(_) {
+        if (writable) writable.abort().catch(() => {});
+        if (progressEl) progressEl.style.display = 'none';
+      }
+      return;
+    }
+    // No FSA folder: let the browser download natively via a direct link.
+    // This avoids RAM buffering and blob-URL popup-blocker issues.
+    if (progressEl) progressEl.style.display = 'none';
+    const a = document.createElement('a');
+    a.href = '/file/' + index; a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
   }
 
   function addFile(name, index) {
     const li = document.createElement('li'); li.className = 'file-item';
-    const body = document.createElement('div'); body.className = 'msg-body';
-    const textEl = document.createElement('div');
-    textEl.className = 'msg-text'; textEl.textContent = '📎 ' + name;
-    body.appendChild(textEl); li.appendChild(body);
+    const autoOn = document.getElementById('auto-dl').checked;
+    const hasFsa  = !!dirHandle;
+
+    const body   = document.createElement('div'); body.className = 'msg-body';
+    const textEl = document.createElement('div'); textEl.className = 'msg-text';
+    textEl.textContent = (autoOn ? '↓ ' : '📎 ') + name;
+    body.appendChild(textEl);
+    li.appendChild(body);
+
+    // Progress bar only meaningful when FSA streams directly
+    const progressEl = document.createElement('progress');
+    progressEl.className = 'file-dl-progress'; progressEl.max = 100; progressEl.value = 0;
+    li.appendChild(progressEl);
 
     const hr = document.createElement('hr'); hr.className = 'msg-divider';
     li.appendChild(hr);
 
     const actions = document.createElement('div'); actions.className = 'msg-actions';
 
-    const dlBtn = document.createElement('button');
-    dlBtn.className = 'action-btn dl'; dlBtn.textContent = '↓ Download';
-    dlBtn.onclick = () => {
-      const a = document.createElement('a');
-      a.href = '/file/' + index; a.download = name;
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    };
+    _batchReceived++;
+    updateBatchStatus();
 
-    const discardBtn = document.createElement('button');
-    discardBtn.className = 'action-btn discard'; discardBtn.textContent = '✕ Discard';
-    discardBtn.onclick = () => li.remove();
+    if (autoOn) {
+      queueDownload(name, index, hasFsa ? progressEl : null);
+      if (!hasFsa) {
+        const note = document.createElement('span');
+        note.style.cssText = 'font-size:0.72rem;color:#888;';
+        note.textContent = 'Saving to browser Downloads…';
+        actions.appendChild(note);
+      }
+      const reBtn = document.createElement('button');
+      reBtn.className = 'action-btn dl'; reBtn.textContent = '↺ Re-download';
+      reBtn.onclick = () => triggerDownload(name, index, hasFsa ? progressEl : null);
+      actions.appendChild(reBtn);
+    } else {
+      const dlBtn = document.createElement('button');
+      dlBtn.className = 'action-btn dl'; dlBtn.textContent = '↓ Download';
+      dlBtn.onclick = () => triggerDownload(name, index, hasFsa ? progressEl : null);
+      const discardBtn = document.createElement('button');
+      discardBtn.className = 'action-btn discard'; discardBtn.textContent = '✕ Discard';
+      discardBtn.onclick = () => li.remove();
+      actions.appendChild(dlBtn); actions.appendChild(discardBtn);
+    }
 
-    actions.appendChild(dlBtn); actions.appendChild(discardBtn);
     li.appendChild(actions);
     messages.prepend(li);
   }
@@ -490,20 +698,152 @@ private val HTML_PAGE = """
     if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); sendReply(); }
   });
 
+  function uploadWithProgress(url, formData, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url);
+      xhr.upload.addEventListener('progress', e => {
+        if (e.lengthComputable) onProgress(e.loaded / e.total);
+      });
+      xhr.onload = () => { onProgress(1); resolve(xhr.status); };
+      xhr.onerror = () => reject(new Error('Network error'));
+      xhr.send(formData);
+    });
+  }
+
+  async function _announceAndWait(transferId, fileList, totalBytes, us) {
+    us.textContent = 'Waiting for approval…';
+    ws.send(JSON.stringify({
+      type: 'transfer_announce', transferId,
+      files: fileList.map(f => ({ name: f.name, size: f.size })),
+      totalBytes
+    }));
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        pendingTransferCallbacks.delete(transferId);
+        resolve(false);
+      }, 60000);
+      pendingTransferCallbacks.set(transferId, ok => {
+        clearTimeout(timer);
+        pendingTransferCallbacks.delete(transferId);
+        resolve(ok);
+      });
+    });
+  }
+
   async function uploadFiles() {
-    const input = document.getElementById('file-input');
-    const us    = document.getElementById('upload-status');
+    const input  = document.getElementById('file-input');
+    const us     = document.getElementById('upload-status');
+    const upProg = document.getElementById('upload-progress');
     if (!input.files.length) return;
-    us.textContent = 'Uploading...';
-    for (const file of input.files) {
-      const fd = new FormData(); fd.append('file', file);
-      await fetch('/upload', { method: 'POST', body: fd });
+    if (ws.readyState !== WebSocket.OPEN) { us.textContent = 'Not connected'; return; }
+
+    const files  = Array.from(input.files);
+    const zipMode = document.getElementById('zip-upload').checked && files.length > 1;
+    const mkId = () => (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : Date.now().toString(36) + Math.random().toString(36).slice(2);
+
+    if (zipMode) {
+      // ── ZIP path ─────────────────────────────────────────────────────────────
+      upProg.style.display = 'block'; upProg.value = 0;
+      us.textContent = 'Creating ZIP…';
+      const zipName = 'archive_' + Date.now() + '.zip';
+      const zipBlob = await createZipBlob(files, p => { upProg.value = p * 50; });
+      const transferId = mkId();
+      const accepted = await _announceAndWait(
+        transferId,
+        [{ name: zipName, size: zipBlob.size }],
+        zipBlob.size, us
+      );
+      if (!accepted) {
+        upProg.style.display = 'none';
+        us.textContent = 'Rejected or timed out.';
+        setTimeout(() => us.textContent = '', 3000);
+        return;
+      }
+      us.textContent = 'Uploading ZIP (' + Math.round(zipBlob.size / 1024) + ' KB)…';
+      const fd = new FormData(); fd.append('file', zipBlob, zipName);
+      await uploadWithProgress(
+        '/upload?transferId=' + encodeURIComponent(transferId), fd,
+        p => { upProg.value = 50 + p * 50; }
+      );
+    } else {
+      // ── Individual files path ─────────────────────────────────────────────────
+      const transferId = mkId();
+      const totalBytes = files.reduce((s, f) => s + f.size, 0);
+      const accepted = await _announceAndWait(transferId, files, totalBytes, us);
+      if (!accepted) {
+        us.textContent = 'Rejected or timed out.';
+        setTimeout(() => us.textContent = '', 3000);
+        return;
+      }
+      upProg.style.display = 'block'; upProg.value = 0;
+      for (let i = 0; i < files.length; i++) {
+        const fd = new FormData(); fd.append('file', files[i]);
+        us.textContent = (i + 1) + '/' + files.length + ': ' + files[i].name;
+        upProg.value = 0;
+        await uploadWithProgress(
+          '/upload?transferId=' + encodeURIComponent(transferId), fd,
+          p => { upProg.value = p * 100; }
+        );
+      }
     }
-    input.value = ''; us.textContent = 'Sent!';
+
+    upProg.value = 100;
+    setTimeout(() => { upProg.style.display = 'none'; }, 600);
+    input.value = ''; us.textContent = 'Done!';
     setTimeout(() => us.textContent = '', 2000);
   }
 
-  function requestNotify() { Notification.requestPermission(); }
+  function showDlWarn(msg) {
+    let warn = document.getElementById('dl-warn');
+    if (!warn) {
+      warn = document.createElement('div'); warn.id = 'dl-warn';
+      document.getElementById('dl-bar').insertAdjacentElement('afterend', warn);
+    }
+    warn.textContent = msg; warn.style.display = '';
+  }
+  function hideDlWarn() {
+    const w = document.getElementById('dl-warn'); if (w) w.style.display = 'none';
+  }
+  function checkDlReady() {
+    const tip = 'In browser Settings → Downloads, set a fixed save folder and make sure \"Ask where to save each file\" is turned OFF.';
+    if (!dirHandle) {
+      if (!('showDirectoryPicker' in window))
+        showDlWarn('⚠ Your browser does not support folder picker. ' + tip);
+      else
+        showDlWarn('⚠ No save folder chosen. Tap “Change” above to pick one. ' + tip);
+    } else {
+      hideDlWarn();
+    }
+  }
+
+  /* ── download settings init ── */
+  (function initDlSettings() {
+    const autoDlEl = document.getElementById('auto-dl');
+    autoDlEl.checked = localStorage.getItem('autoDownload') === 'true';
+    autoDlEl.addEventListener('change', () => {
+      localStorage.setItem('autoDownload', autoDlEl.checked);
+      if (autoDlEl.checked) checkDlReady(); else hideDlWarn();
+    });
+    const saved = localStorage.getItem('dl-folder-name');
+    if (saved) document.getElementById('dl-path').textContent = saved + ' (re-select to use)';
+    if (autoDlEl.checked) checkDlReady();
+  })();
+
+  async function chooseFolder() {
+    if (!('showDirectoryPicker' in window)) {
+      alert('Folder picker not supported in this browser.\nIn browser Settings → Downloads, set a default save location.');
+      return;
+    }
+    try {
+      dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      document.getElementById('dl-path').textContent = dirHandle.name;
+      localStorage.setItem('dl-folder-name', dirHandle.name);
+      hideDlWarn();
+    } catch(_) {}
+  }
 </script>
 </body>
 </html>
@@ -512,6 +852,11 @@ private val HTML_PAGE = """
 // ── KtorServer ────────────────────────────────────────────────────────────────
 
 class KtorServer(private val context: Context) {
+
+    companion object {
+        private const val TAG = "KtorServer"
+        const val AUTO_ZIP_THRESHOLD = 1000
+    }
 
     private val deviceManager = DeviceManager(context)
 
@@ -528,12 +873,26 @@ class KtorServer(private val context: Context) {
         val openStream: () -> InputStream?
     )
 
-    private val connectedSessions     = ConcurrentHashMap<String, InternalSession>()
-    private val pairingDeferreds      = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
-    private val pendingAliasOverrides = ConcurrentHashMap<String, String>()
-    private val sharedFiles           = AtomicReference<List<SharedFileInfo>>(emptyList())
-    private val _transfers            = ConcurrentHashMap<String, TransferProgress>()
-    private val _transferLastUpdate   = ConcurrentHashMap<String, Long>()
+    private val connectedSessions       = ConcurrentHashMap<String, InternalSession>()
+    private val pairingDeferreds        = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+    private val pendingAliasOverrides   = ConcurrentHashMap<String, String>()
+    private val sharedFiles             = AtomicReference<List<SharedFileInfo>>(emptyList())
+    private val _transfers              = ConcurrentHashMap<String, TransferProgress>()
+    private val _transferLastUpdate     = ConcurrentHashMap<String, Long>()
+    private val transferPrefsManager    = TransferPrefsManager(context)
+    private val pendingTransferDeferreds = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+    private val acceptedTransferLocations = ConcurrentHashMap<String, String?>()
+    private val acceptedTransferFiles    = ConcurrentHashMap<String, List<IncomingTransfer.FileEntry>>()
+    private val transferFileCounters     = ConcurrentHashMap<String, AtomicInteger>()
+    private val _incomingXfers           = ConcurrentHashMap<String, TransferProgress>()
+    private val _incomingXferLastUpdate  = ConcurrentHashMap<String, Long>()
+    private var pendingZipFile: java.io.File? = null
+    private var pendingZipName: String = ""
+    private var pendingZipJob: Job? = null
+    private val _outgoingBatchTotal = AtomicInteger(0)
+    private val _outgoingBatchDone  = AtomicInteger(0)
+    private val _incomingBatchTotal = ConcurrentHashMap<String, Int>()
+    private val _incomingBatchDone  = ConcurrentHashMap<String, AtomicInteger>()
     private val scope               = CoroutineScope(Dispatchers.IO)
 
     // ── Public StateFlows (observed by UI) ───────────────────────────────────
@@ -545,8 +904,13 @@ class KtorServer(private val context: Context) {
     val clientCount      = MutableStateFlow(0)
     val receivedMessages = MutableStateFlow<List<ReceivedMessage>>(emptyList())
     val receivedFiles    = MutableStateFlow<List<ReceivedFile>>(emptyList())
-    val activeTransfers  = MutableStateFlow<List<TransferProgress>>(emptyList())
+    val activeTransfers   = MutableStateFlow<List<TransferProgress>>(emptyList())
+    val incomingTransfers = MutableStateFlow<List<TransferProgress>>(emptyList())
     val zipProgress      = MutableStateFlow<Float?>(null)
+    val outgoingBatch    = MutableStateFlow<TransferBatch?>(null)
+    val incomingBatch    = MutableStateFlow<Map<String, TransferBatch>>(emptyMap())
+    val pendingTransfers = MutableStateFlow<List<IncomingTransfer>>(emptyList())
+    val transferPrefs    = MutableStateFlow(TransferPrefs())
 
     private var server: ApplicationEngine? = null
     private var jmDns: JmDNS? = null
@@ -557,6 +921,7 @@ class KtorServer(private val context: Context) {
         val ifaces = getNetworkIfaces()
         networkIfaces.value = ifaces
         trustedDevices.value = deviceManager.getAll()
+        transferPrefs.value = transferPrefsManager.load()
 
         // mDNS on first WiFi interface (user can switch later)
         val mdnsIp = ifaces.firstOrNull { it.label == "Wi-Fi" }?.ip
@@ -675,8 +1040,15 @@ class KtorServer(private val context: Context) {
         try {
             for (frame in incoming) {
                 if (frame is Frame.Text) {
-                    receivedMessages.value = receivedMessages.value +
-                        ReceivedMessage(text = frame.readText(), fromAlias = alias)
+                    val text = frame.readText()
+                    val obj = runCatching { JSONObject(text) }.getOrNull()
+                    when (obj?.optString("type")) {
+                        "transfer_announce" -> obj?.let { o ->
+                            runCatching { handleTransferAnnounce(o, alias, this) }
+                        }
+                        else -> receivedMessages.value = receivedMessages.value +
+                            ReceivedMessage(text = text, fromAlias = alias)
+                    }
                 }
             }
         } finally {
@@ -695,6 +1067,69 @@ class KtorServer(private val context: Context) {
     }
 
     fun rejectPairing(deviceId: String) { pairingDeferreds[deviceId]?.complete(false) }
+
+    // ── Transfer announcement handler ────────────────────────────────────────
+
+    private suspend fun handleTransferAnnounce(
+        msg: JSONObject,
+        alias: String,
+        session: DefaultWebSocketSession
+    ) {
+        val transferId = msg.optString("transferId").takeIf { it.isNotEmpty() } ?: return
+        val totalBytes = msg.optLong("totalBytes", 0L)
+        val filesArr   = msg.optJSONArray("files") ?: JSONArray()
+        val files = (0 until filesArr.length()).map { i ->
+            val o = filesArr.getJSONObject(i)
+            IncomingTransfer.FileEntry(o.optString("name", "file"), o.optLong("size", 0L))
+        }
+
+        val prefs      = transferPrefsManager.load()
+        val autoAccept = prefs.autoDownload && totalBytes <= prefs.approvalThresholdBytes
+
+        if (autoAccept) {
+            acceptedTransferLocations[transferId] = prefs.downloadLocationUri
+            acceptedTransferFiles[transferId] = files
+            _incomingBatchTotal[transferId] = files.size
+            _incomingBatchDone[transferId] = AtomicInteger(0)
+            refreshIncomingBatch()
+            session.send(Frame.Text(json("type" to "transfer_accept", "transferId" to transferId)))
+        } else {
+            val announcement = IncomingTransfer(transferId, alias, files, totalBytes)
+            val deferred     = CompletableDeferred<Boolean>()
+            pendingTransferDeferreds[transferId] = deferred
+            pendingTransfers.value = pendingTransfers.value + announcement
+            try {
+                val accepted = deferred.await()
+                if (accepted) {
+                    acceptedTransferLocations[transferId] = transferPrefsManager.load().downloadLocationUri
+                    acceptedTransferFiles[transferId] = files
+                    _incomingBatchTotal[transferId] = files.size
+                    _incomingBatchDone[transferId] = AtomicInteger(0)
+                    refreshIncomingBatch()
+                    session.send(Frame.Text(json("type" to "transfer_accept", "transferId" to transferId)))
+                } else {
+                    session.send(Frame.Text(json("type" to "transfer_reject", "transferId" to transferId)))
+                }
+            } finally {
+                pendingTransferDeferreds.remove(transferId)
+                pendingTransfers.value = pendingTransfers.value.filter { it.transferId != transferId }
+            }
+        }
+    }
+
+    fun acceptTransfer(transferId: String) { pendingTransferDeferreds[transferId]?.complete(true) }
+    fun rejectTransfer(transferId: String) { pendingTransferDeferreds[transferId]?.complete(false) }
+
+    fun updateTransferPrefs(prefs: TransferPrefs) {
+        transferPrefsManager.save(prefs)
+        transferPrefs.value = prefs
+    }
+
+    fun updateDownloadLocation(uriString: String) {
+        val updated = transferPrefsManager.load().copy(downloadLocationUri = uriString)
+        transferPrefsManager.save(updated)
+        transferPrefs.value = updated
+    }
 
     // ── Device management ────────────────────────────────────────────────────
 
@@ -756,12 +1191,34 @@ class KtorServer(private val context: Context) {
         }
     }
 
-    fun shareFile(name: String, size: Long, openStream: () -> InputStream?, targetDeviceIds: Set<String>? = null) =
+    fun shareFile(name: String, size: Long, openStream: () -> InputStream?, targetDeviceIds: Set<String>? = null) {
+        android.util.Log.d(TAG, "shareFile: $name ($size bytes) → ${targetDeviceIds ?: "all"}")
         shareFiles(listOf(FileToShare(name, size, openStream)), targetDeviceIds)
+    }
 
     fun shareFiles(files: List<FileToShare>, targetDeviceIds: Set<String>? = null) {
+        if (files.size > AUTO_ZIP_THRESHOLD) {
+            android.util.Log.i(TAG, "shareFiles: ${files.size} files > $AUTO_ZIP_THRESHOLD → auto-zipping")
+            val zipName = "files_${System.currentTimeMillis()}.zip"
+            createAndShareZip(files, zipName, targetDeviceIds)
+            return
+        }
+        android.util.Log.d(TAG, "shareFiles: sharing ${files.size} individual file(s)")
         val infos = files.map { SharedFileInfo(it.name, it.size, it.openStream) }
         sharedFiles.set(infos)
+        _outgoingBatchTotal.set(infos.size)
+        _outgoingBatchDone.set(0)
+        outgoingBatch.value = TransferBatch(infos.size, 0)
+        val batchMsg = json("type" to "file_batch", "count" to infos.size.toString())
+        if (targetDeviceIds != null) {
+            scope.launch {
+                targetDeviceIds.forEach { id ->
+                    connectedSessions[id]?.session?.runCatching { send(Frame.Text(batchMsg)) }
+                }
+            }
+        } else {
+            broadcastJson(batchMsg)
+        }
         infos.forEachIndexed { index, info ->
             val j = json("type" to "file", "name" to info.name, "index" to index.toString())
             if (targetDeviceIds != null) {
@@ -778,6 +1235,7 @@ class KtorServer(private val context: Context) {
 
     fun createAndShareZip(files: List<FileToShare>, zipName: String, targetDeviceIds: Set<String>? = null) {
         scope.launch {
+            android.util.Log.i(TAG, "createAndShareZip: zipping ${files.size} files → $zipName")
             zipProgress.value = 0f
             val tmp = java.io.File(context.cacheDir, "zip_${UUID.randomUUID()}.zip")
             try {
@@ -798,13 +1256,70 @@ class KtorServer(private val context: Context) {
                         zos.closeEntry()
                     }
                 }
+                android.util.Log.i(TAG, "createAndShareZip: done, zip size=${tmp.length()} bytes")
                 shareFile(zipName, tmp.length(), { tmp.inputStream() }, targetDeviceIds)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                android.util.Log.e(TAG, "createAndShareZip: failed", e)
                 tmp.delete()
             } finally {
                 zipProgress.value = null
             }
         }
+    }
+
+    fun startBackgroundZip(files: List<FileToShare>, zipName: String) {
+        cancelPendingZip()
+        pendingZipName = zipName
+        pendingZipJob = scope.launch {
+            zipProgress.value = 0f
+            val tmp = java.io.File(context.cacheDir, "zip_${UUID.randomUUID()}.zip")
+            var success = false
+            try {
+                val totalSize = files.sumOf { maxOf(it.size, 0L) }
+                var processed = 0L
+                java.util.zip.ZipOutputStream(tmp.outputStream().buffered(65_536)).use { zos ->
+                    for (file in files) {
+                        zos.putNextEntry(java.util.zip.ZipEntry(file.name))
+                        file.openStream()?.use { input ->
+                            val buf = ByteArray(65_536)
+                            var n: Int
+                            while (input.read(buf).also { n = it } != -1) {
+                                zos.write(buf, 0, n)
+                                processed += n
+                                if (totalSize > 0) zipProgress.value = processed.toFloat() / totalSize
+                            }
+                        }
+                        zos.closeEntry()
+                    }
+                }
+                pendingZipFile = tmp
+                zipProgress.value = 1f
+                success = true
+            } finally {
+                if (!success) { tmp.delete(); zipProgress.value = null }
+            }
+        }
+    }
+
+    fun sendPendingZip(targetDeviceIds: Set<String>?) {
+        scope.launch {
+            pendingZipJob?.join()
+            val file = pendingZipFile ?: return@launch
+            val name = pendingZipName
+            pendingZipFile = null
+            pendingZipName = ""
+            zipProgress.value = null
+            shareFile(name, file.length(), { file.inputStream() }, targetDeviceIds)
+        }
+    }
+
+    fun cancelPendingZip() {
+        pendingZipJob?.cancel()
+        pendingZipJob = null
+        pendingZipFile?.delete()
+        pendingZipFile = null
+        pendingZipName = ""
+        zipProgress.value = null
     }
 
     fun sendTextAsFile(text: String, targetDeviceIds: Set<String>? = null) {
@@ -826,7 +1341,11 @@ class KtorServer(private val context: Context) {
 
     private suspend fun serveSharedFile(call: ApplicationCall, index: Int) {
         val info = sharedFiles.get().getOrNull(index)
-            ?: return call.respond(HttpStatusCode.NotFound)
+            ?: run {
+                android.util.Log.w(TAG, "serveSharedFile: index $index not found (list size=${sharedFiles.get().size})")
+                return call.respond(HttpStatusCode.NotFound)
+            }
+        android.util.Log.d(TAG, "serveSharedFile: serving index=$index name=${info.name} size=${info.size}")
         val tid = UUID.randomUUID().toString()
         call.response.header(HttpHeaders.ContentDisposition, "attachment; filename=\"${info.name}\"")
         try {
@@ -842,15 +1361,19 @@ class KtorServer(private val context: Context) {
                     var n: Int
                     while (input.read(buf).also { n = it } != -1) {
                         write(buf, 0, n)
+                        flush()
                         sent += n
-                        val now = System.currentTimeMillis()
-                        if (now - (_transferLastUpdate[tid] ?: 0L) >= 100L) {
-                            _transferLastUpdate[tid] = now
-                            _transfers[tid] = TransferProgress(tid, info.name, sent, info.size)
-                            refreshTransfers()
-                        }
+                        _transfers[tid] = TransferProgress(tid, info.name, sent, info.size)
+                        refreshTransfers()
                     }
                 }
+            }
+            val done = _outgoingBatchDone.incrementAndGet()
+            val total = _outgoingBatchTotal.get()
+            outgoingBatch.value = TransferBatch(total, done)
+            android.util.Log.d(TAG, "serveSharedFile: completed index=$index name=${info.name} batch=$done/$total")
+            if (done >= total) {
+                scope.launch { delay(2000); if (_outgoingBatchDone.get() >= _outgoingBatchTotal.get()) outgoingBatch.value = null }
             }
         } finally {
             _transfers.remove(tid)
@@ -860,26 +1383,120 @@ class KtorServer(private val context: Context) {
     }
 
     private suspend fun receiveUpload(call: ApplicationCall) {
+        val transferId = call.request.queryParameters["transferId"]
+        val isAutoSave = transferId != null && acceptedTransferLocations.containsKey(transferId)
+        val locationUri: String? = if (isAutoSave) acceptedTransferLocations[transferId] else null
+        val fileIdx = if (transferId != null)
+            transferFileCounters.getOrPut(transferId) { AtomicInteger(0) }.getAndIncrement()
+        else 0
+
         call.receiveMultipart().forEachPart { part ->
             if (part is PartData.FileItem) {
                 val name = part.originalFileName ?: "upload_${System.currentTimeMillis()}"
-                val tmp = java.io.File(context.cacheDir, "recv_${UUID.randomUUID()}")
-                try {
-                    withContext(Dispatchers.IO) {
-                        part.streamProvider().use { input ->
-                            tmp.outputStream().use { output ->
-                                input.copyTo(output, bufferSize = 65_536)
-                            }
+                val expectedSize = if (transferId != null)
+                    acceptedTransferFiles[transferId]?.getOrNull(fileIdx)?.size ?: -1L
+                else -1L
+                val tid = transferId ?: UUID.randomUUID().toString()
+                _incomingXfers[tid] = TransferProgress(tid, name, 0L, expectedSize)
+                refreshIncomingTransfers()
+                var rcvBytes = 0L
+                val onProgress: (Long) -> Unit = { rcv ->
+                    rcvBytes = rcv
+                    val now = System.currentTimeMillis()
+                    if (now - (_incomingXferLastUpdate[tid] ?: 0L) >= 16L) {
+                        _incomingXferLastUpdate[tid] = now
+                        _incomingXfers[tid] = TransferProgress(tid, name, rcv, expectedSize)
+                        refreshIncomingTransfers()
+                    }
+                }
+                if (isAutoSave) autoSaveFile(name, locationUri, part, onProgress)
+                else saveToCache(name, part, onProgress)
+                val finalSize = if (expectedSize > 0L) expectedSize else rcvBytes
+                _incomingXfers[tid] = TransferProgress(tid, name, finalSize, finalSize)
+                refreshIncomingTransfers()
+                // Update incoming batch done count
+                if (transferId != null) {
+                    val done = _incomingBatchDone.getOrPut(transferId) { AtomicInteger(0) }.incrementAndGet()
+                    val total = _incomingBatchTotal[transferId] ?: done
+                    android.util.Log.d(TAG, "receiveUpload: file done $done/$total for transferId=$transferId")
+                    refreshIncomingBatch()
+                    if (done >= total) {
+                        scope.launch {
+                            delay(2000)
+                            _incomingBatchTotal.remove(transferId)
+                            _incomingBatchDone.remove(transferId)
+                            refreshIncomingBatch()
                         }
                     }
-                    receivedFiles.update { it + ReceivedFile(name = name, size = tmp.length(), tempFile = tmp) }
-                } catch (_: Exception) {
-                    tmp.delete()
                 }
+                delay(500)
+                _incomingXfers.remove(tid)
+                _incomingXferLastUpdate.remove(tid)
+                refreshIncomingTransfers()
             }
             part.dispose()
         }
         call.respond(HttpStatusCode.OK)
+    }
+
+    private suspend fun autoSaveFile(
+        name: String, safUriStr: String?, part: PartData.FileItem,
+        onProgress: (Long) -> Unit = {}
+    ) {
+        try {
+            val outputStream = if (safUriStr != null) {
+                val treeUri = Uri.parse(safUriStr)
+                val docUri  = DocumentsContract.buildDocumentUriUsingTree(
+                    treeUri, DocumentsContract.getTreeDocumentId(treeUri)
+                )
+                val fileUri = DocumentsContract.createDocument(
+                    context.contentResolver, docUri, "application/octet-stream", name
+                ) ?: throw Exception("createDocument failed")
+                context.contentResolver.openOutputStream(fileUri)
+            } else {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+                    put(MediaStore.Downloads.RELATIVE_PATH, "Downloads/LocalShare/")
+                }
+                val uri = context.contentResolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
+                ) ?: throw Exception("MediaStore insert failed")
+                context.contentResolver.openOutputStream(uri)
+            }
+            withContext(Dispatchers.IO) {
+                outputStream?.use { out ->
+                    part.streamProvider().use { inp ->
+                        val buf = ByteArray(65_536); var n: Int; var rcv = 0L
+                        while (inp.read(buf).also { n = it } != -1) {
+                            out.write(buf, 0, n); rcv += n; onProgress(rcv)
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            saveToCache(name, part, onProgress)
+        }
+    }
+
+    private suspend fun saveToCache(
+        name: String, part: PartData.FileItem,
+        onProgress: (Long) -> Unit = {}
+    ) {
+        val tmp = java.io.File(context.cacheDir, "recv_${UUID.randomUUID()}")
+        try {
+            withContext(Dispatchers.IO) {
+                part.streamProvider().use { input ->
+                    tmp.outputStream().use { output ->
+                        val buf = ByteArray(65_536); var n: Int; var rcv = 0L
+                        while (input.read(buf).also { n = it } != -1) {
+                            output.write(buf, 0, n); rcv += n; onProgress(rcv)
+                        }
+                    }
+                }
+            }
+            receivedFiles.update { it + ReceivedFile(name = name, size = tmp.length(), tempFile = tmp) }
+        } catch (_: Exception) { tmp.delete() }
     }
 
     private fun broadcastJson(j: String) {
@@ -897,6 +1514,16 @@ class KtorServer(private val context: Context) {
 
     private fun refreshTransfers() {
         activeTransfers.value = _transfers.values.toList()
+    }
+
+    private fun refreshIncomingTransfers() {
+        incomingTransfers.value = _incomingXfers.values.toList()
+    }
+
+    private fun refreshIncomingBatch() {
+        incomingBatch.value = _incomingBatchTotal.mapValues { (tid, total) ->
+            TransferBatch(total, _incomingBatchDone[tid]?.get() ?: 0)
+        }
     }
 
     private fun updateConnected() {
