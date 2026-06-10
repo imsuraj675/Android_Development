@@ -10,9 +10,9 @@ import io.ktor.http.content.PartData
 import io.ktor.http.content.forEachPart
 import io.ktor.http.content.streamProvider
 import io.ktor.server.application.*
-import io.ktor.server.cio.*
-import io.ktor.server.engine.ApplicationEngine
-import io.ktor.server.engine.embeddedServer
+import io.ktor.server.netty.*
+import io.ktor.server.engine.*
+import io.netty.channel.WriteBufferWaterMark
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -350,7 +350,7 @@ private val HTML_PAGE = """
 
   /* ── WebSocket ── */
   const statusEl = document.getElementById('status');
-  const ws = new WebSocket('ws://' + location.host + '/socket');
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/socket');
 
   ws.onopen = () => {
     ws.send(JSON.stringify({
@@ -856,9 +856,12 @@ class KtorServer(private val context: Context) {
     companion object {
         private const val TAG = "KtorServer"
         const val AUTO_ZIP_THRESHOLD = 1000
+        const val HTTP_PORT  = 8080
+        const val HTTPS_PORT = 8443
     }
 
-    private val deviceManager = DeviceManager(context)
+    private val deviceManager   = DeviceManager(context)
+    private val certManager     = CertificateManager(context.filesDir)
 
     private data class InternalSession(
         val deviceId: String,
@@ -934,33 +937,114 @@ class KtorServer(private val context: Context) {
             scope.launch {
                 try {
                     jmDns = JmDNS.create(java.net.InetAddress.getByName(mdnsIp), "phone")
-                    jmDns?.registerService(ServiceInfo.create("_http._tcp.local.", "Sender", 8080, ""))
+                    jmDns?.registerService(ServiceInfo.create("_https._tcp.local.", "Sender", HTTPS_PORT, ""))
                 } catch (_: Exception) {}
             }
         }
 
-        // Ktor binds to 0.0.0.0 by default → accepts connections on all interfaces
-        server = embeddedServer(CIO, port = 8080) {
-            install(WebSockets)
-            routing {
-                get("/") {
-                    // Redirect phone.local requests to the actual IP so the browser
-                    // URL bar switches to the IP and WebSocket connects directly.
-                    val host = call.request.headers[HttpHeaders.Host]?.substringBefore(':')
-                    val target = activeMdnsIp.value
-                    if (host == "phone.local" && target != null) {
-                        call.respondRedirect("http://$target:8080/", permanent = false)
-                    } else {
-                        call.respondText(HTML_PAGE, ContentType.Text.Html)
+        // Build TLS keystore — CA is reused across restarts; server cert regenerated each start
+        val currentIps = ifaces.map { it.ip }
+        val keyStore = try {
+            certManager.buildKeyStore(currentIps)
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Failed to build TLS keystore — aborting start", e)
+            isRunning.value = false
+            return
+        }
+
+        server = embeddedServer(Netty, applicationEngineEnvironment {
+            // HTTP on 8080 — serves /ca.crt and /install for first-time setup; all else redirects
+            connector {
+                host = "0.0.0.0"
+                port = HTTP_PORT
+            }
+            // HTTPS on 8443 — full app
+            sslConnector(
+                keyStore = keyStore,
+                keyAlias = CertificateManager.SERVER_KEY_ALIAS,
+                keyStorePassword = { CertificateManager.KEYSTORE_PASSWORD.toCharArray() },
+                privateKeyPassword = { CertificateManager.KEYSTORE_PASSWORD.toCharArray() }
+            ) {
+                host = "0.0.0.0"
+                port = HTTPS_PORT
+            }
+            module {
+                install(WebSockets)
+
+                // Redirect all plain-HTTP traffic to HTTPS, except the CA cert endpoints which
+                // must be reachable before the user has installed the CA cert.
+                intercept(ApplicationCallPipeline.Plugins) {
+                    if (call.request.local.localPort == HTTP_PORT) {
+                        val path = call.request.uri
+                        if (path == "/ca.crt" || path == "/install") return@intercept
+                        val reqHost = call.request.headers[HttpHeaders.Host]?.substringBefore(':') ?: ""
+                        val targetHost = if (reqHost == "phone.local")
+                            activeMdnsIp.value ?: reqHost else reqHost
+                        call.respondRedirect("https://$targetHost:$HTTPS_PORT$path", permanent = false)
+                        finish()
                     }
                 }
-                get("/file")           { serveSharedFile(call, 0) }
-                get("/file/{index}")   { serveSharedFile(call, call.parameters["index"]?.toIntOrNull() ?: 0) }
-                post("/upload")        { receiveUpload(call) }
-                webSocket("/socket") { handleSocket() }
+
+                routing {
+                    // ── CA cert download (HTTP + HTTPS) ──────────────────────────
+                    get("/ca.crt") {
+                        val pem = certManager.getCACertPem()
+                        if (pem == null) {
+                            call.respond(HttpStatusCode.NotFound)
+                        } else {
+                            call.response.header(
+                                HttpHeaders.ContentDisposition,
+                                "attachment; filename=\"sender_ca.crt\""
+                            )
+                            call.respondBytes(pem, ContentType("application", "x-pem-file"))
+                        }
+                    }
+
+                    // ── First-time install guide (HTTP only) ─────────────────────
+                    get("/install") {
+                        val ip = activeMdnsIp.value ?: call.request.local.localAddress
+                        call.respondText(
+                            buildInstallPage(ip),
+                            ContentType.Text.Html
+                        )
+                    }
+
+                    // ── Main app (HTTPS) ─────────────────────────────────────────
+                    get("/") {
+                        // Redirect phone.local → actual IP so the URL bar and WebSocket
+                        // use the IP directly (avoids mDNS resolution on every WS frame).
+                        val host = call.request.headers[HttpHeaders.Host]?.substringBefore(':')
+                        val target = activeMdnsIp.value
+                        if (host == "phone.local" && target != null) {
+                            call.respondRedirect("https://$target:$HTTPS_PORT/", permanent = false)
+                        } else {
+                            call.respondText(HTML_PAGE, ContentType.Text.Html)
+                        }
+                    }
+                    get("/file")         { serveSharedFile(call, 0) }
+                    get("/file/{index}") { serveSharedFile(call, call.parameters["index"]?.toIntOrNull() ?: 0) }
+                    post("/upload")      { receiveUpload(call) }
+                    webSocket("/socket") { handleSocket() }
+                }
+            }
+        }) {
+            // Trim Netty threads — LAN server never needs the default 2×CPU pool
+            connectionGroupSize = 1
+            workerGroupSize    = 2
+            callGroupSize      = 4
+            // Generous timeouts so large file transfers don't get cut
+            responseWriteTimeoutSeconds = 300
+            requestReadTimeoutSeconds   = 300
+            // Raise write watermarks so the producer coroutine never stalls waiting
+            // for a 64-KB TLS flush.  Low = 256 KB, high = 1 MB.
+            channelPipelineConfig = {
+                channel().config().setWriteBufferWaterMark(
+                    WriteBufferWaterMark(256 * 1024, 1024 * 1024)
+                )
             }
         }
         server?.start(wait = false)
+        android.util.Log.i(TAG, "Server started — HTTP redirect on $HTTP_PORT, HTTPS on $HTTPS_PORT")
     }
 
     fun stop() {
@@ -976,7 +1060,7 @@ class KtorServer(private val context: Context) {
             try {
                 jmDns?.close()
                 jmDns = JmDNS.create(java.net.InetAddress.getByName(ip), "phone")
-                jmDns?.registerService(ServiceInfo.create("_http._tcp.local.", "Sender", 8080, ""))
+                jmDns?.registerService(ServiceInfo.create("_https._tcp.local.", "Sender", HTTPS_PORT, ""))
             } catch (_: Exception) {}
         }
     }
@@ -1262,7 +1346,13 @@ class KtorServer(private val context: Context) {
                     }
                 }
                 android.util.Log.i(TAG, "createAndShareZip: done, zip size=${tmp.length()} bytes")
-                shareFile(zipName, tmp.length(), { tmp.inputStream() }, targetDeviceIds)
+                // Stream from temp file; delete it once the last byte is read.
+                shareFile(zipName, tmp.length(), {
+                    tmp.inputStream().also { _ ->
+                        // deletion is best-effort; cacheDir is cleared by the OS anyway
+                        scope.launch { delay(30_000); tmp.delete() }
+                    }
+                }, targetDeviceIds)
             } catch (e: Exception) {
                 android.util.Log.e(TAG, "createAndShareZip: failed", e)
                 tmp.delete()
@@ -1358,20 +1448,35 @@ class KtorServer(private val context: Context) {
                 contentType = ContentType.Application.OctetStream,
                 contentLength = info.size.takeIf { it >= 0L }
             ) {
-                val buf = ByteArray(65_536)
+                val readBuf = ByteArray(131_072)   // 128 KB reads
+                val flushEvery = 524_288L          // flush once per 512 KB
+                var pendingFlush = 0L
                 var sent = 0L
+                var lastUiUpdate = 0L
                 _transfers[tid] = TransferProgress(tid, info.name, 0L, info.size)
                 refreshTransfers()
                 info.openStream()?.use { input ->
                     var n: Int
-                    while (input.read(buf).also { n = it } != -1) {
-                        write(buf, 0, n)
-                        flush()
+                    while (input.read(readBuf).also { n = it } != -1) {
+                        write(readBuf, 0, n)
                         sent += n
-                        _transfers[tid] = TransferProgress(tid, info.name, sent, info.size)
-                        refreshTransfers()
+                        pendingFlush += n
+                        if (pendingFlush >= flushEvery) {
+                            flush()
+                            pendingFlush = 0
+                        }
+                        val now = System.currentTimeMillis()
+                        if (now - lastUiUpdate >= 16L) {
+                            lastUiUpdate = now
+                            _transfers[tid] = TransferProgress(tid, info.name, sent, info.size)
+                            refreshTransfers()
+                        }
                     }
+                    if (pendingFlush > 0) flush()
                 }
+                // Final accurate value after loop
+                _transfers[tid] = TransferProgress(tid, info.name, sent, info.size)
+                refreshTransfers()
             }
             val done = _outgoingBatchDone.incrementAndGet()
             val total = _outgoingBatchTotal.get()
@@ -1472,7 +1577,7 @@ class KtorServer(private val context: Context) {
             withContext(Dispatchers.IO) {
                 outputStream?.use { out ->
                     part.streamProvider().use { inp ->
-                        val buf = ByteArray(65_536); var n: Int; var rcv = 0L
+                        val buf = ByteArray(131_072); var n: Int; var rcv = 0L
                         while (inp.read(buf).also { n = it } != -1) {
                             out.write(buf, 0, n); rcv += n; onProgress(rcv)
                         }
@@ -1493,7 +1598,7 @@ class KtorServer(private val context: Context) {
             withContext(Dispatchers.IO) {
                 part.streamProvider().use { input ->
                     tmp.outputStream().use { output ->
-                        val buf = ByteArray(65_536); var n: Int; var rcv = 0L
+                        val buf = ByteArray(131_072); var n: Int; var rcv = 0L
                         while (input.read(buf).also { n = it } != -1) {
                             output.write(buf, 0, n); rcv += n; onProgress(rcv)
                         }
@@ -1540,6 +1645,51 @@ class KtorServer(private val context: Context) {
     private fun refreshTrustedDevices() {
         trustedDevices.value = deviceManager.getAll()
     }
+
+    private fun buildInstallPage(ip: String): String = """
+        <!DOCTYPE html><html lang="en"><head>
+        <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Sender — Install CA Certificate</title>
+        <style>
+          body{font-family:sans-serif;max-width:560px;margin:40px auto;padding:20px;
+               background:#0f0f0f;color:#e0e0e0;}
+          h1{font-size:1.3rem;margin-bottom:6px;}
+          .step{background:#1e1e1e;border-left:3px solid #4caf50;border-radius:6px;
+                padding:12px 16px;margin:12px 0;}
+          .step h2{font-size:1rem;margin:0 0 6px;}
+          .step p{font-size:.9rem;margin:4px 0;color:#bbb;}
+          a.dl{display:inline-block;margin-top:8px;padding:8px 18px;background:#4caf50;
+               color:#000;border-radius:4px;font-weight:600;text-decoration:none;}
+          code{background:#2a2a2a;padding:2px 5px;border-radius:3px;font-size:.85rem;}
+          .go{display:inline-block;margin-top:16px;padding:10px 22px;background:#42a5f5;
+              color:#000;border-radius:4px;font-weight:600;text-decoration:none;}
+        </style></head><body>
+        <h1>🔒 Sender — First-Time HTTPS Setup</h1>
+        <p>To use Sender securely, install its local CA certificate once. This certificate
+           is unique to your phone and only trusted within your device.</p>
+
+        <div class="step"><h2>Step 1 — Download the CA certificate</h2>
+          <p>Click below to download <code>sender_ca.crt</code></p>
+          <a class="dl" href="/ca.crt">⬇ Download sender_ca.crt</a>
+        </div>
+
+        <div class="step"><h2>Step 2 — Install the certificate</h2>
+          <p><b>Windows:</b> Double-click the file → "Install Certificate" → "Local Machine" →
+             "Place all certificates in the following store" → "Trusted Root Certification Authorities"</p>
+          <p><b>macOS:</b> Double-click the file → open in Keychain Access → drag to "System" →
+             double-click → expand "Trust" → set "When using this certificate" to "Always Trust"</p>
+          <p><b>Android:</b> Settings → Security → More security settings → Install from storage →
+             select the file → choose "CA certificate"</p>
+          <p><b>Firefox (all platforms):</b> Settings → Privacy &amp; Security → Certificates →
+             View Certificates → Authorities → Import → select the file → check "Trust this CA to identify websites"</p>
+        </div>
+
+        <div class="step"><h2>Step 3 — Open Sender</h2>
+          <p>After installing the certificate, open the secure Sender page:</p>
+          <a class="go" href="https://$ip:$HTTPS_PORT/">Open Sender (HTTPS)</a>
+        </div>
+        </body></html>
+    """.trimIndent()
 
     private fun json(vararg pairs: Pair<String, String>): String {
         val o = JSONObject()

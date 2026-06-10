@@ -313,15 +313,21 @@ private fun QrDialog(ifaces: List<NetworkIface>, onDismiss: () -> Unit) {
                 ifaces.forEachIndexed { i, iface ->
                     if (i > 0) { Spacer(Modifier.height(8.dp)); HorizontalDivider(); Spacer(Modifier.height(8.dp)) }
                     Text(iface.label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    QrCodeImage("http://${iface.ip}:8080")
-                    Text("http://${iface.ip}:8080", fontSize = 12.sp, fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.primary)
+                    QrCodeImage("https://${iface.ip}:${KtorServer.HTTPS_PORT}")
+                    Text("https://${iface.ip}:${KtorServer.HTTPS_PORT}", fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.height(4.dp))
+                    Text("First time? Install CA cert:", fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("http://${iface.ip}:${KtorServer.HTTP_PORT}/install", fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 if (ifaces.isNotEmpty()) { Spacer(Modifier.height(8.dp)); HorizontalDivider(); Spacer(Modifier.height(8.dp)) }
                 Text("mDNS", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                QrCodeImage("http://phone.local:8080")
-                Text("http://phone.local:8080", fontSize = 12.sp, fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.primary)
+                QrCodeImage("https://phone.local:${KtorServer.HTTPS_PORT}")
+                Text("https://phone.local:${KtorServer.HTTPS_PORT}", fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.primary)
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
@@ -1146,7 +1152,7 @@ fun SenderScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "${iface.label}: http://${iface.ip}:8080",
+                                text = "${iface.label}: https://${iface.ip}:${KtorServer.HTTPS_PORT}",
                                 fontSize = 12.sp,
                                 fontFamily = FontFamily.Monospace,
                                 color = MaterialTheme.colorScheme.primary,
@@ -1173,6 +1179,17 @@ fun SenderScreen(
                         fontFamily = FontFamily.Monospace,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+
+                    // First-time HTTPS setup hint
+                    if (networkIfaces.isNotEmpty()) {
+                        val firstIp = networkIfaces.first().ip
+                        Text(
+                            text = "First time? → http://$firstIp:${KtorServer.HTTP_PORT}/install",
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
 
                 // Connection status

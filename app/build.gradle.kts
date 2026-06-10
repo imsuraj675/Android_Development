@@ -44,6 +44,13 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += "/META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+            excludes += "/META-INF/INDEX.LIST"
+            excludes += "/META-INF/io.netty.versions.properties"
+            excludes += "/META-INF/BC1024KE.RSA"
+            excludes += "/META-INF/BC1024KE.SF"
+            excludes += "/META-INF/BC2048KE.RSA"
+            excludes += "/META-INF/BC2048KE.SF"
         }
     }
 }
@@ -59,10 +66,11 @@ dependencies {
     implementation(libs.androidx.activity.compose)
 
     implementation(libs.ktor.server.core)
-    implementation(libs.ktor.server.cio)
+    implementation(libs.ktor.server.netty)
     implementation(libs.ktor.server.websockets)
     implementation(libs.jmdns)
     implementation(libs.zxing.core)
+    implementation(libs.bcpkix)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
