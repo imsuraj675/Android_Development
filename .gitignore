@@ -13,3 +13,5 @@
 .externalNativeBuild
 .cxx
 local.properties
+task.md
+KNOWLEDGE.md
