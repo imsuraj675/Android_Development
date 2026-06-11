@@ -31,7 +31,6 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -62,6 +61,8 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.ui.Alignment
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -115,8 +116,10 @@ class MainActivity : ComponentActivity() {
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestNotifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
-        app.startServer()
-        SenderService.start(this)
+        if (app.wasServerRunning) {
+            app.startServer()
+            SenderService.start(this)
+        }
         handleShareIntent(intent)
 
         setContent {
@@ -222,7 +225,9 @@ class MainActivity : ComponentActivity() {
                     onAcceptTransfer     = { id -> server.acceptTransfer(id) },
                     onRejectTransfer     = { id -> server.rejectTransfer(id) },
                     onSaveTransferPrefs  = { prefs -> server.updateTransferPrefs(prefs) },
-                    onPickDownloadFolder = { pickFolder.launch(null) }
+                    onPickDownloadFolder = { pickFolder.launch(null) },
+                    onRefresh            = { server.refreshNetworkIfaces(); server.clearLogs() },
+                    onCancelTransfer     = { id -> server.cancelTransfer(id) }
                 )
             }
         }
@@ -391,7 +396,7 @@ private fun PairingDialog(request: PairingRequest, onAccept: (String) -> Unit, o
                     color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(8.dp)
                 ) {
-                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text("Name:", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text(request.name, fontSize = 12.sp, fontWeight = FontWeight.Medium)
@@ -754,7 +759,7 @@ private fun TransferApprovalDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(8.dp)) {
-                    Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Icon(Icons.Filled.DevicesOther, null, tint = MaterialTheme.colorScheme.primary)
                         Column {
                             Text(transfer.deviceAlias, fontWeight = FontWeight.Medium)
@@ -808,7 +813,7 @@ private fun SettingsDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Filled.Settings, null, tint = MaterialTheme.colorScheme.primary) },
-        title = { Text("Transfer Settings") },
+        title = { Text("Transfer") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 // Auto-download row
@@ -838,7 +843,7 @@ private fun SettingsDialog(
                 }
                 // Download folder
                 Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(10.dp)) {
-                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Icon(Icons.Filled.Folder, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
                             Text("Download folder", fontSize = 14.sp, fontWeight = FontWeight.Medium)
@@ -856,6 +861,15 @@ private fun SettingsDialog(
                         }
                     }
                 }
+                // Version footer
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Text(
+                    "v${BuildConfig.VERSION_NAME}",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Center
+                )
             }
         },
         confirmButton = {
@@ -1006,7 +1020,8 @@ private fun TransferCard(
     batch: TransferBatch?,
     label: String,
     icon: ImageVector,
-    tint: Color
+    tint: Color,
+    onCancel: (String) -> Unit = {}
 ) {
     if (transfers.isEmpty() && batch == null) return
     Surface(
@@ -1057,6 +1072,17 @@ private fun TransferCard(
                                 if (t.totalBytes > 0) "${formatBytes(t.bytesSent)} / ${formatBytes(t.totalBytes)}"
                                 else formatBytes(t.bytesSent),
                                 fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        IconButton(
+                            onClick = { onCancel(t.id) },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Filled.Cancel,
+                                contentDescription = "Cancel transfer",
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(20.dp)
                             )
                         }
                     }
@@ -1163,13 +1189,35 @@ fun SenderScreen(
     onAcceptTransfer: (String) -> Unit,
     onRejectTransfer: (String) -> Unit,
     onSaveTransferPrefs: (TransferPrefs) -> Unit,
-    onPickDownloadFolder: () -> Unit
+    onPickDownloadFolder: () -> Unit,
+    onRefresh: () -> Unit,
+    onCancelTransfer: (String) -> Unit
 ) {
-    var text         by remember { mutableStateOf("") }
-    var showQr       by remember { mutableStateOf(false) }
-    var showDevices  by remember { mutableStateOf(false) }
-    var showSettings by remember { mutableStateOf(false) }
-    var pendingAction by remember { mutableStateOf<String?>(null) }
+    var text              by remember { mutableStateOf("") }
+    var showQr            by remember { mutableStateOf(false) }
+    var showDevices       by remember { mutableStateOf(false) }
+    var showSettings      by remember { mutableStateOf(false) }
+    var pendingAction     by remember { mutableStateOf<String?>(null) }
+    var selectedSendTab   by remember { mutableStateOf(0) }
+    var sharedFilesToSend by remember { mutableStateOf<List<Pair<String, Uri>>?>(null) }
+    var isRefreshing      by remember { mutableStateOf(false) }
+    val screenScope       = rememberCoroutineScope()
+
+    // Inline-load shared text → message tab (no popup)
+    LaunchedEffect(pendingShareText) {
+        val t = pendingShareText ?: return@LaunchedEffect
+        text = t
+        selectedSendTab = 0
+        onDismissShareText()
+    }
+
+    // Inline-load shared files → file tab (no popup)
+    LaunchedEffect(pendingShareFiles) {
+        val files = pendingShareFiles ?: return@LaunchedEffect
+        sharedFilesToSend = files
+        selectedSendTab = 1
+        onDismissShare()
+    }
 
     // ── Dialogs ──────────────────────────────────────────────────────────────
 
@@ -1195,8 +1243,12 @@ fun SenderScreen(
     if (pendingAction != null && connectedDevices.size > 1) {
         TargetDeviceDialog(devices = connectedDevices, onSelect = { ids ->
             when (pendingAction) {
-                "text"   -> { onSend(text, ids); text = "" }
-                "asFile" -> { onSendAsFile(text, ids); text = "" }
+                "text"        -> { onSend(text, ids); text = "" }
+                "asFile"      -> { onSendAsFile(text, ids); text = "" }
+                "sharedFiles" -> {
+                    sharedFilesToSend?.let { onSendShared(it, ids) }
+                    sharedFilesToSend = null
+                }
             }
             pendingAction = null
         }, onDismiss = { pendingAction = null })
@@ -1216,20 +1268,6 @@ fun SenderScreen(
             onDismiss = onCancelFilePick)
     }
 
-    if (pendingShareFiles != null) {
-        ShareTargetDialog(files = pendingShareFiles, connectedDevices = connectedDevices,
-            isServerRunning = isServerRunning,
-            onSend = { ids -> onSendShared(pendingShareFiles, ids) },
-            onDismiss = onDismissShare)
-    }
-
-    if (pendingShareText != null) {
-        ShareTextDialog(text = pendingShareText, connectedDevices = connectedDevices,
-            isServerRunning = isServerRunning,
-            onSend = { asFile, ids -> onSendSharedText(pendingShareText, asFile, ids) },
-            onDismiss = onDismissShareText)
-    }
-
     fun triggerSend(action: String) {
         when (connectedDevices.size) {
             0    -> {}
@@ -1244,6 +1282,15 @@ fun SenderScreen(
         }
     }
 
+    fun triggerSharedFilesSend() {
+        val files = sharedFilesToSend ?: return
+        when (connectedDevices.size) {
+            0    -> {}
+            1    -> { onSendShared(files, setOf(connectedDevices.first().deviceId)); sharedFilesToSend = null }
+            else -> pendingAction = "sharedFiles"
+        }
+    }
+
     // ── Aggregated incoming batch ─────────────────────────────────────────────
     val incomingBatchAgg = if (incomingBatch.isNotEmpty()) TransferBatch(
         total = incomingBatch.values.sumOf { it.total },
@@ -1255,9 +1302,26 @@ fun SenderScreen(
         topBar = {
             TopAppBar(
                 title = {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Icon(Icons.Filled.Wifi, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(22.dp))
-                        Text("Sender", fontWeight = FontWeight.SemiBold)
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.Wifi,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.alignByBaseline()
+                        )
+                        Text(
+                            "Sender",
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.alignByBaseline()
+                        )
+                        Text(
+                            "v${BuildConfig.VERSION_NAME}",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.alignByBaseline()
+                        )
                     }
                 },
                 actions = {
@@ -1278,8 +1342,20 @@ fun SenderScreen(
         },
         containerColor = MaterialTheme.colorScheme.background
     ) { innerPadding ->
+        PullToRefreshBox(
+            isRefreshing = isRefreshing,
+            onRefresh = {
+                isRefreshing = true
+                onRefresh()
+                screenScope.launch {
+                    kotlinx.coroutines.delay(400)
+                    isRefreshing = false
+                }
+            },
+            modifier = Modifier.fillMaxSize().padding(innerPadding)
+        ) {
         LazyColumn(
-            modifier = Modifier.fillMaxSize().padding(innerPadding),
+            modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
@@ -1365,9 +1441,13 @@ fun SenderScreen(
                     sendAsZip = sendAsZip,
                     onToggleSendAsZip = onToggleSendAsZip,
                     clientCount = clientCount,
+                    selectedTab = selectedSendTab,
+                    sharedFiles = sharedFilesToSend,
                     onSendText = { triggerSend("text") },
                     onSendAsFile = { triggerSend("asFile") },
-                    onPickFile = onPickFile
+                    onPickFile = onPickFile,
+                    onSendSharedFiles = { triggerSharedFilesSend() },
+                    onClearSharedFiles = { sharedFilesToSend = null }
                 )
             }
 
@@ -1384,7 +1464,8 @@ fun SenderScreen(
                         batch = outgoingBatch,
                         label = "Sending",
                         icon = Icons.Filled.Upload,
-                        tint = MaterialTheme.colorScheme.primary
+                        tint = MaterialTheme.colorScheme.primary,
+                        onCancel = onCancelTransfer
                     )
                 }
             }
@@ -1397,7 +1478,8 @@ fun SenderScreen(
                         batch = incomingBatchAgg,
                         label = "Receiving",
                         icon = Icons.Filled.Download,
-                        tint = MaterialTheme.colorScheme.secondary
+                        tint = MaterialTheme.colorScheme.secondary,
+                        onCancel = onCancelTransfer
                     )
                 }
             }
@@ -1417,7 +1499,8 @@ fun SenderScreen(
                     MessageCard(m, onCopy = { onCopyText(m.text) })
                 }
             }
-        }
+        } // LazyColumn
+        } // PullToRefreshBox
     }
 }
 
@@ -1714,12 +1797,21 @@ private fun SendCard(
     sendAsZip: Boolean,
     onToggleSendAsZip: (Boolean) -> Unit,
     clientCount: Int,
+    selectedTab: Int,
+    sharedFiles: List<Pair<String, Uri>>?,
     onSendText: () -> Unit,
     onSendAsFile: () -> Unit,
-    onPickFile: () -> Unit
+    onPickFile: () -> Unit,
+    onSendSharedFiles: () -> Unit,
+    onClearSharedFiles: () -> Unit
 ) {
     val pagerState = rememberPagerState(pageCount = { 2 })
     val coroutineScope = rememberCoroutineScope()
+
+    // Navigate to the requested tab when selectedTab changes (e.g., after a share intent)
+    LaunchedEffect(selectedTab) {
+        pagerState.animateScrollToPage(selectedTab)
+    }
 
     Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surface,
         modifier = Modifier.fillMaxWidth(), shadowElevation = 1.dp
@@ -1747,7 +1839,10 @@ private fun SendCard(
             HorizontalPager(state = pagerState) { page ->
                 when (page) {
                     0    -> MessageTabContent(text, onTextChange, clientCount, onSendText, onSendAsFile)
-                    else -> FileTabContent(sendAsZip, onToggleSendAsZip, clientCount, onPickFile)
+                    else -> FileTabContent(
+                        sendAsZip, onToggleSendAsZip, clientCount, onPickFile,
+                        sharedFiles, onSendSharedFiles, onClearSharedFiles
+                    )
                 }
             }
         }
@@ -1836,9 +1931,49 @@ private fun FileTabContent(
     sendAsZip: Boolean,
     onToggleSendAsZip: (Boolean) -> Unit,
     clientCount: Int,
-    onPickFile: () -> Unit
+    onPickFile: () -> Unit,
+    sharedFiles: List<Pair<String, Uri>>? = null,
+    onSendSharedFiles: () -> Unit = {},
+    onClearSharedFiles: () -> Unit = {}
 ) {
     Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+        // Shared-files banner: shown when files were loaded via a share intent
+        if (sharedFiles != null) {
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Icon(Icons.Filled.Share, null, modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer)
+                        Text(
+                            if (sharedFiles.size == 1) sharedFiles.first().first
+                            else "${sharedFiles.size} files ready to send",
+                            fontSize = 12.sp, fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis
+                        )
+                        IconButton(onClick = onClearSharedFiles, modifier = Modifier.size(20.dp)) {
+                            Icon(Icons.Filled.Close, null, modifier = Modifier.size(14.dp),
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer)
+                        }
+                    }
+                    Button(
+                        onClick = onSendSharedFiles,
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = clientCount > 0
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Send, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (clientCount > 0) "Send" else "Connect a device to send")
+                    }
+                }
+            }
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -1862,7 +1997,7 @@ private fun FileTabContent(
             Spacer(Modifier.width(6.dp))
             Text("Choose & Send File")
         }
-        if (clientCount == 0) {
+        if (clientCount == 0 && sharedFiles == null) {
             Text("Connect a device to send files", fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.fillMaxWidth())

@@ -291,7 +291,7 @@ main {
 
 /* upload-status: inline in the opts row, but when it has content it wraps to full width */
 #upload-status {
-  font-size: 0.78rem; color: var(--accent); flex: 1; text-align: right; min-width: 0;
+  margin-top: 10px; font-size: 0.78rem; color: var(--accent); flex: 1; text-align: right; min-width: 0;
 }
 #upload-status:not(:empty) {
   width: 100%; order: 3; text-align: left;
@@ -415,7 +415,10 @@ main {
         <button class="btn btn-primary" id="upload-btn" onclick="uploadFiles()">
           <svg class="icon"><use href="#ic-upload"/></svg> Upload
         </button>
-        <span id="upload-status"></span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;min-height:20px">
+        <div id="upload-status" style="flex:1;min-width:0;font-size:13px"></div>
+        <button class="btn btn-danger" id="cancel-upload-btn" style="display:none;padding:3px 10px;font-size:12px" onclick="cancelUpload()">✕ Cancel</button>
       </div>
       <progress id="upload-progress" max="100" value="0"></progress>
     </div>
@@ -561,6 +564,13 @@ main {
     if (msg.type === 'file')            { addFile(msg.name, parseInt(msg.index)||0); return; }
     if (msg.type === 'transfer_accept') { const cb = pendingTransferCallbacks.get(msg.transferId); if (cb) cb(true);  return; }
     if (msg.type === 'transfer_reject') { const cb = pendingTransferCallbacks.get(msg.transferId); if (cb) cb(false); return; }
+    if (msg.type === 'transfer_cancelled') {
+      // App cancelled the transfer — abort the active XHR if it matches
+      if (_activeXhr && (_activeTransferId === msg.transferId || !msg.transferId)) {
+        cancelUpload();
+      }
+      return;
+    }
   };
 
   /* ---- inbox helpers ---- */
@@ -815,10 +825,10 @@ main {
   function sendTextAsFile(){
     const msg=replyInput.value.trim();if(!msg)return;
     const blob=new Blob([msg],{type:'text/plain'});
-    const fd=new FormData();fd.append('file',blob,'message_'+Date.now()+'.txt');
+    const name='message_'+Date.now()+'.txt';
     const us=document.getElementById('upload-status');
     us.textContent='Sending…';
-    fetch('/upload',{method:'POST',body:fd}).then(()=>{
+    uploadRaw('/upload?name='+encodeURIComponent(name),blob,()=>{}).then(()=>{
       replyInput.value='';replyInput.style.height='';
       us.textContent='Done!';setTimeout(()=>us.textContent='',2000);
     });
@@ -850,14 +860,57 @@ main {
     }
   });
 
-  /* ---- upload with progress ---- */
-  function uploadWithProgress(url,formData,onProgress){
-    return new Promise((resolve,reject)=>{
-      const xhr=new XMLHttpRequest();xhr.open('POST',url);
-      xhr.upload.addEventListener('progress',e=>{if(e.lengthComputable)onProgress(e.loaded/e.total);});
-      xhr.onload=()=>{onProgress(1);resolve(xhr.status);};
-      xhr.onerror=()=>reject(new Error('Network error'));
-      xhr.send(formData);
+  /* ---- raw binary upload — gives XHR real progress events on the upload side ---- */
+  let _activeXhr = null;
+  let _activeTransferId = null;
+
+  function _setCancelBtn(visible) {
+    document.getElementById('cancel-upload-btn').style.display = visible ? '' : 'none';
+  }
+
+  function cancelUpload() {
+    if (!_activeXhr) return;
+    const tid = _activeTransferId;
+    _activeXhr.abort();
+    _activeXhr = null;
+    _activeTransferId = null;
+    _setCancelBtn(false);
+    if (tid && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({type:'cancel_upload', transferId: tid}));
+    }
+    const us = document.getElementById('upload-status');
+    us.textContent = 'Cancelled';
+    setTimeout(() => { us.textContent = ''; }, 2000);
+    const upProg = document.getElementById('upload-progress');
+    upProg.value = 0;
+    upProg.style.display = 'none';
+  }
+
+  function uploadRaw(url, fileOrBlob, onProgress) {
+    // Extract transferId from the URL query string so we can cancel via WS if needed
+    const params = new URL(url, window.location.href).searchParams;
+    const tid = params.get('transferId');
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      _activeXhr = xhr;
+      _activeTransferId = tid;
+      _setCancelBtn(true);
+      xhr.upload.addEventListener('progress', e => { if (e.lengthComputable) onProgress(e.loaded / e.total); });
+      xhr.onload = () => {
+        _activeXhr = null; _activeTransferId = null; _setCancelBtn(false);
+        onProgress(1); resolve(xhr.status);
+      };
+      xhr.onerror = () => {
+        _activeXhr = null; _activeTransferId = null; _setCancelBtn(false);
+        reject(new Error('Network error'));
+      };
+      xhr.onabort = () => {
+        _activeXhr = null; _activeTransferId = null; _setCancelBtn(false);
+        reject(new Error('Aborted'));
+      };
+      xhr.send(fileOrBlob);
     });
   }
 
@@ -881,32 +934,45 @@ main {
     const zipMode=document.getElementById('zip-upload').checked&&files.length>1;
     const mkId=()=>(typeof crypto!=='undefined'&&crypto.randomUUID)?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2);
 
-    if(zipMode){
-      upProg.style.display='block';upProg.value=0;
-      us.textContent='Creating ZIP…';
-      const zipName='archive_'+Date.now()+'.zip';
-      const zipBlob=await createZipBlob(files,p=>{upProg.value=p*50;});
-      const transferId=mkId();
-      const accepted=await _announceAndWait(transferId,[{name:zipName,size:zipBlob.size}],zipBlob.size,us);
-      if(!accepted){upProg.style.display='none';us.textContent='Rejected';setTimeout(()=>us.textContent='',3000);return;}
-      us.textContent='Uploading ZIP…';
-      const fd=new FormData();fd.append('file',zipBlob,zipName);
-      await uploadWithProgress('/upload?transferId='+encodeURIComponent(transferId),fd,p=>{upProg.value=50+p*50;});
-    }else{
-      const transferId=mkId();
-      const totalBytes=files.reduce((s,f)=>s+f.size,0);
-      const accepted=await _announceAndWait(transferId,files,totalBytes,us);
-      if(!accepted){us.textContent='Rejected';setTimeout(()=>us.textContent='',3000);return;}
-      upProg.style.display='block';upProg.value=0;
-      for(let i=0;i<files.length;i++){
-        const fd=new FormData();fd.append('file',files[i]);
-        us.textContent=(i+1)+'/'+files.length+': '+files[i].name;upProg.value=0;
-        await uploadWithProgress('/upload?transferId='+encodeURIComponent(transferId),fd,p=>{upProg.value=p*100;});
+    try {
+      if(zipMode){
+        upProg.style.display='block';upProg.value=0;
+        us.textContent='Creating ZIP…';
+        const zipName='archive_'+Date.now()+'.zip';
+        const zipBlob=await createZipBlob(files,p=>{upProg.value=p*50;});
+        const transferId=mkId();
+        const accepted=await _announceAndWait(transferId,[{name:zipName,size:zipBlob.size}],zipBlob.size,us);
+        if(!accepted){upProg.style.display='none';us.textContent='Rejected';setTimeout(()=>us.textContent='',3000);return;}
+        us.textContent='Uploading ZIP…';
+        await uploadRaw(
+          '/upload?name='+encodeURIComponent(zipName)+'&transferId='+encodeURIComponent(transferId),
+          zipBlob, p=>{upProg.value=50+p*50;}
+        );
+      }else{
+        const transferId=mkId();
+        const totalBytes=files.reduce((s,f)=>s+f.size,0);
+        const accepted=await _announceAndWait(transferId,files,totalBytes,us);
+        if(!accepted){us.textContent='Rejected';setTimeout(()=>us.textContent='',3000);return;}
+        upProg.style.display='block';upProg.value=0;
+        for(let i=0;i<files.length;i++){
+          us.textContent=(i+1)+'/'+files.length+': '+files[i].name;upProg.value=0;
+          await uploadRaw(
+            '/upload?name='+encodeURIComponent(files[i].name)+'&transferId='+encodeURIComponent(transferId),
+            files[i], p=>{upProg.value=p*100;}
+          );
+        }
       }
+      upProg.value=100;setTimeout(()=>{upProg.style.display='none';},600);
+      input.value='';document.getElementById('selected-files-info').textContent='';
+      us.textContent='Done!';setTimeout(()=>us.textContent='',2000);
+    } catch(err) {
+      // Aborted or network error — UI already cleaned up by uploadRaw / cancelUpload
+      if (err.message !== 'Aborted') {
+        us.textContent = 'Upload failed';
+        setTimeout(() => { us.textContent = ''; }, 3000);
+      }
+      upProg.style.display='none';
     }
-    upProg.value=100;setTimeout(()=>{upProg.style.display='none';},600);
-    input.value='';document.getElementById('selected-files-info').textContent='';
-    us.textContent='Done!';setTimeout(()=>us.textContent='',2000);
   }
 
   /* ---- download folder settings ---- */

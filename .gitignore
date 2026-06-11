@@ -1,6 +1,7 @@
 *.iml
 .gradle
 /local.properties
+keystore.properties
 /.idea/caches
 /.idea/libraries
 /.idea/modules.xml
@@ -15,3 +16,6 @@
 local.properties
 task.md
 KNOWLEDGE.md
+/app/debug
+/app/release
+sender.jks
